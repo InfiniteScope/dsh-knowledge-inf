@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      local_model_smoke:
+        description: Run the real isolated local embedding and rerank smoke matrix
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -32,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [22.19.0, 24.x]
+        node: [22.19.0, 24.x, 26.x]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -123,15 +128,15 @@ jobs:
       - name: Install tarball and boot DSH
         run: npm run smoke:packed
 
-  local-rerank-smoke:
-    name: Local rerank smoke (Ubuntu, Node ${{ matrix.node }})
-    if: github.event_name == 'workflow_dispatch' && inputs.local_rerank_smoke
+  local-model-smoke:
+    name: Local model smoke (Ubuntu, Node ${{ matrix.node }})
+    if: github.event_name == 'workflow_dispatch' && (inputs.local_rerank_smoke || inputs.local_model_smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        node: [22.19.0, 24.x]
+        node: [22.19.0, 24.x, 26.x]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -153,4 +158,5 @@ jobs:
         working-directory: ../dsh
         run: pnpm install --frozen-lockfile && pnpm run build:lib
       - run: pnpm install --frozen-lockfile
+      - run: npm run smoke:local-embedding
       - run: npm run smoke:local-rerank

@@ -5,6 +5,7 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/p
 import { basename, dirname, join, relative } from 'node:path'
 import {
   cancelLocalModel,
+  getLocalEmbeddingReadiness,
   getHfEndpoint,
   getLocalModelStatus,
   isLocalModelDownloaded,
@@ -219,7 +220,18 @@ async function summarize(descriptor: LocalModelDescriptor): Promise<LocalModelSu
       return { ...descriptor, status: live.status, health: live.status === 'error' ? 'unhealthy' : 'unchecked', progress: live.progress, message: live.message }
     }
     const downloaded = live.status === 'ready' || await isLocalModelDownloaded(descriptor.id)
-    return { ...descriptor, status: downloaded ? 'ready' : 'not_downloaded', health: downloaded ? 'healthy' : 'unchecked', progress: downloaded ? 100 : 0, message: '' }
+    if (!downloaded) return { ...descriptor, status: 'not_downloaded', health: 'unchecked', progress: 0, message: '' }
+    const ready = await getLocalEmbeddingReadiness(descriptor.id)
+    if (ready === undefined) {
+      return {
+        ...descriptor,
+        status: live.status === 'ready' ? 'validating' : 'unhealthy',
+        health: live.status === 'ready' ? 'checking' : 'unchecked',
+        progress: 100,
+        message: '模型已下载，正在或等待隔离运行时兼容性验证',
+      }
+    }
+    return { ...descriptor, status: 'ready', health: 'healthy', progress: 100, message: '', lastCheckedAt: ready.validatedAt }
   }
   const live = liveRerankStatus.get(descriptor.id)
   if (live !== undefined && live.status !== 'ready') return { ...descriptor, ...live }

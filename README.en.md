@@ -148,9 +148,9 @@ The first-token proactive path never launches a local reranker. A remote reranke
 <details>
 <summary>How local models run</summary>
 
-The default local embedding model is `onnx-community/Qwen3-Embedding-0.6B-ONNX`, approximately 585 MB with 1024 output dimensions. It runs in a dedicated worker thread. Idle cleanup can release ONNX sessions while keeping the worker alive, which avoids re-registering Linux native bindings in a replacement worker.
+The default local embedding model is `onnx-community/Qwen3-Embedding-0.6B-ONNX`, approximately 585 MB with 1024 output dimensions. It runs in a dedicated child process with versioned IPC. The process can release idle sessions, and a crash or hard timeout is recovered by starting a clean child without restarting DSH. Downloads use model-specific staging storage; only a successful isolated load and vector probe are promoted and recorded in a fingerprinted readiness marker.
 
-`rerankModel: local:Xenova/bge-reranker-base` runs in a separate child process isolated from the embedding worker. Search never downloads a reranker implicitly; the model must be downloaded and pass its health check first. Custom Hugging Face ONNX rerankers are experimental and must pass single-logit capability validation plus a positive/negative self-test.
+`rerankModel: local:Xenova/bge-reranker-base` runs in its own child process, independent from the embedding process. Search never downloads a reranker implicitly; the model must be downloaded and pass its health check first. Custom Hugging Face ONNX rerankers are experimental and must pass single-logit capability validation plus a positive/negative self-test.
 
 Models are cached under `<DSH_HOME>/cache/dsh-knowledge/local-models` by default. Set `hfEndpoint` in the panel or use the `HF_ENDPOINT` environment variable to choose a mirror. OCR defaults to `hf-mirror.com`; users outside China can use `https://huggingface.co`.
 
@@ -287,11 +287,11 @@ Injected material is explicitly labelled as untrusted reference evidence and can
 |---|---|---|
 | Empty or stale base/document filters | Only `undefined` means unrestricted; an empty set matches zero documents in both SQLite lanes | A filtering mistake cannot silently search the whole library |
 | Remote-rerank timeout or malformed output | Shared deadline, strict result-index and score validation, structured `rerank` status | Return the original recall order and do not apply a rerank threshold |
-| Local rerank hangs or crashes | Isolated child process, hard-timeout termination, clean restart, and separation from the embedding worker | Degrade the current search without restarting the embedding lifecycle |
+| Local embedding or rerank hangs/crashes | Independent child processes, versioned strict IPC, hard-timeout termination, one clean embedding recovery, and separate lifecycles | Recover or degrade the affected operation without restarting DSH or the other local-model lane |
 | Incomplete or incompatible local weights | Require configuration, tokenizer files, and non-empty ONNX weights; write a runtime-versioned, file-fingerprinted readiness marker only after self-test | Search never downloads implicitly or treats “an ONNX file exists” as readiness |
 | Repeated local-rerank failures | Total queue cap of 16; open a five-minute circuit after three consecutive timeout/crash/runtime/invalid-response failures, with one half-open probe | Prevent a broken model from repeatedly consuming process and latency budgets |
 | Partial replacement rebuild or directory rescan | Replace the committed source only after the new raw source, parse, and index succeed; retain per-file results | One failed item does not destroy the old version or hide successful siblings |
-| Missing release files or platform drift | Node 22.19/24 quality gates, Windows/Linux/macOS native tests, Windows/Linux tarball install-and-boot smoke, and optional real local-rerank smoke | Both source builds and the published npm shape are continuously checked |
+| Missing release files or platform drift | Node 22.19/24/26 quality gates, Windows/Linux/macOS native tests, Windows/Linux tarball install-and-boot smoke, and manually triggered real local-model smoke | Both source builds and the published npm shape are continuously checked |
 
 These constraints share one principle: fail closed on scope, fail soft on ranking enhancement, and preserve the committed version of user data. Degradation is exposed through structured state or UI feedback instead of being presented as success.
 
@@ -299,14 +299,14 @@ These constraints share one principle: fail closed on scope, fail soft on rankin
 
 ## Architecture
 
-One bundle mounts three plugin rows. Local embeddings and OCR run in separate worker threads, while local reranking runs in a replaceable child process. Local inference failures remain outside the DSH host's main execution space.
+One bundle mounts three plugin rows. Local embeddings and local reranking run in separate replaceable child processes; OCR remains in its own worker thread. Local inference failures remain outside the DSH host's main execution space.
 
 | Component | Platform | Responsibility |
 |---|---|---|
 | `knowledge` (`ctx.knowledge`) | host | Storage, chunking, embedding/parser orchestration, retrieval, OCR scheduling, and `/knowledge/*` HTTP APIs |
 | `tool-knowledge` | host | Registration and execution of the 14 model-facing tools |
 | `ui-knowledge` | client | Sidebar entry, workspace management panel, and same-origin API calls |
-| `embed-worker` | worker thread | Local transformers.js embedding inference; large model sessions stay outside the host process |
+| `embed-process` | child process | Local transformers.js embedding inference; strict IPC, staging/readiness probing, and recoverable native-model lifecycle |
 | `ocr-worker` | worker thread | mupdf page rendering plus PaddleOCR, OpenCV, and Tesseract recognition |
 | `rerank-process.mjs` | child process | Local cross-encoder reranking, hard-timeout isolation, and process-level recovery |
 
@@ -398,7 +398,7 @@ Deployment defaults live in the `knowledge` row of `cordis.patch.yml`. The manag
 | `autoRetrieve` | `true` | Search user messages proactively and inject relevant background |
 | `autoRetrieveWeight` | `3` | Per-base proactive seat cap, range 0–5; `0` excludes the base |
 | `localModelCacheDir` | `''` | Empty uses `<DSH_HOME>/cache/dsh-knowledge/local-models` |
-| `localWorkerIdleTimeoutMs` | `60000` | Idle time before releasing local embedding sessions; `0` keeps them hot |
+| `localWorkerIdleTimeoutMs` | `60000` | Idle time before releasing local embedding-process sessions; `0` keeps them hot |
 | `chunkStorePath` | `''` | Empty uses `<DSH_HOME>/storages/knowledge-chunks.sqlite` |
 
 Empty per-base fields inherit the global configuration. `localModelCacheDir`, `localWorkerIdleTimeoutMs`, and `chunkStorePath` are process-wide. API keys are stored as plain text on the local machine, so protect the profile data directory.

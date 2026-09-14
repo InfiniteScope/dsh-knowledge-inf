@@ -1,19 +1,28 @@
 /**
  * Embedding providers. `openai` targets any OpenAI-compatible `/embeddings`
  * endpoint; `ollama` targets a local Ollama server; `local` runs an embedding
- * model through transformers.js in a DEDICATED WORKER THREAD (Cherry Studio's
- * "in its own worker" model): the ~600MB model and every inference tensor live
- * off the main process, so a large import batch can never freeze the host.
+ * model through transformers.js in a DEDICATED CHILD PROCESS: the ~600MB
+ * model and every inference tensor live off the main process, so a large
+ * import batch can never freeze the host and native failures are recoverable.
  * Every provider returns one L2-normalized vector per input text.
  * @module dsh-knowledge/knowledge/embed
  */
 
-import { rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
-import { Worker } from 'node:worker_threads'
+import { dirname, join, resolve } from 'node:path'
+import { fork, type ChildProcess } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { applyGlobalProxy, httpFetch, NETWORK_HINT } from './net.js'
+import {
+  LOCAL_EMBED_PROTOCOL_VERSION,
+  isLocalEmbedProgress,
+  isLocalEmbedResponse,
+  type LocalEmbedOperation,
+  type LocalEmbedResponse,
+} from './embed-protocol.js'
+import { loadLocalReranker, rerankInLocalProcess } from './local-rerank.js'
 import type { EmbeddingProvider } from './types.js'
 
 // Route every global fetch (including transformers.js model downloads) through
@@ -82,9 +91,8 @@ export async function embedTexts(
   if (texts.length === 0) return []
   if (provider === 'none') throw new Error('embedding provider is "none" — configure an endpoint or a local model, or keep lexical search')
   if (provider === 'local') {
-    // The long-lived embedding worker must not be terminated (reloading the
-    // native ONNX binding is unsafe on Linux), but the owning search can stop
-    // waiting immediately while the isolated worker finishes its current job.
+    // The owning search can stop waiting immediately while the isolated child
+    // finishes its current job; only a hard fault terminates that child.
     return await withAbortSignal(embedLocal(model.trim() === '' ? DEFAULT_LOCAL_MODEL : model, texts), signal)
   }
   if (model.trim() === '') throw new Error('embedding model is empty')
@@ -126,7 +134,7 @@ async function withAbortSignal<T>(promise: Promise<T>, signal: AbortSignal | und
   })
 }
 
-// ── local (dedicated worker thread running transformers.js) ─────────────────
+// ── local (isolated child process running transformers.js) ──────────────────
 
 export interface LocalModelStatus {
   model: string
@@ -134,6 +142,17 @@ export interface LocalModelStatus {
   /** 0–100 download progress while `downloading`. */
   progress: number
   message: string
+}
+
+/** Persistent evidence that a local embedding model was opened in the
+ * isolated runtime and produced a validated vector. */
+export interface LocalEmbeddingReadiness {
+  readonly schemaVersion: 1
+  readonly modelId: string
+  readonly fingerprint: string
+  readonly dimensions: number
+  readonly validatedAt: number
+  readonly runtime: { readonly node: string; readonly transformers: '3.7.x'; readonly onnxruntime: '1.21.0' }
 }
 
 type Pooling = 'last_token' | 'cls' | 'mean'
@@ -155,8 +174,9 @@ export function poolingFor(modelId: string): Pooling {
   return 'mean'
 }
 
-/** Current load/download state for an in-process model (for the settings panel). */
+/** Current load/download state for an isolated local model (for the settings panel). */
 const localModelStatus = new Map<string, LocalModelStatus>()
+const EMBEDDING_READY_FILE = '.dsh-embedding-ready.json'
 
 export function getLocalModelStatus(modelId: string): LocalModelStatus {
   return localModelStatus.get(modelId) ?? { model: modelId, status: 'idle', progress: 0, message: '' }
@@ -169,61 +189,127 @@ export function markLocalModelError(modelId: string, message: string): void {
 
 /** Whether a model's cached weights are already on disk (a real `.onnx` weight file). */
 export async function isLocalModelDownloaded(modelId: string): Promise<boolean> {
-  const { readdir } = await import('node:fs/promises')
   try {
-    const entries = await readdir(join(localModelCacheDir(), modelId, 'onnx'))
-    return entries.some(name => name.endsWith('.onnx'))
+    const modelRoot = join(localModelCacheDir(), modelId)
+    const [config, onnxEntries, tokenizer] = await Promise.all([
+      stat(join(modelRoot, 'config.json')),
+      readdir(join(modelRoot, 'onnx')),
+      Promise.any([
+        stat(join(modelRoot, 'tokenizer.json')),
+        stat(join(modelRoot, 'tokenizer_config.json')),
+        stat(join(modelRoot, 'vocab.txt')),
+        stat(join(modelRoot, 'spiece.model')),
+      ]),
+    ])
+    if (config.size <= 0 || tokenizer.size <= 0) return false
+    for (const name of onnxEntries) {
+      if (!name.endsWith('.onnx')) continue
+      if ((await stat(join(modelRoot, 'onnx', name))).size > 0) return true
+    }
+    return false
   } catch {
     return false
   }
 }
 
-interface WorkerResponse {
-  id?: number
-  ok?: boolean
-  vectors?: number[][]
-  scores?: number[]
-  error?: string
-  type?: 'progress' | 'released' | 'cancelled'
-  modelId?: string
-  status?: LocalModelStatus['status']
-  progress?: number
-  message?: string
+function embeddingReadinessPath(modelId: string): string {
+  return join(localModelCacheDir(), modelId, EMBEDDING_READY_FILE)
 }
 
-// A single lazy worker owns every local model (Cherry: one worker per kind,
-// serialized requests, idle model-release, crash-then-respawn). `unref()`
-// keeps the worker from holding the host process open on shutdown. The idle
-// timeout is configurable (localWorkerIdleTimeoutMs, 0 = keep models hot):
-// on idle the worker UNLOADS its models (pipeline.dispose frees the ONNX
-// sessions) but stays alive — terminating and respawning would re-dlopen
-// onnxruntime's native binding, which on Linux fails with "Module did not
-// self-register".
+async function localModelFingerprint(modelId: string): Promise<string | undefined> {
+  const root = join(localModelCacheDir(), modelId)
+  const files: Array<{ path: string; size: number; mtimeMs: number }> = []
+  const walk = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (entry.name === EMBEDDING_READY_FILE) continue
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) await walk(path)
+      else if (entry.isFile()) {
+        const metadata = await stat(path)
+        files.push({
+          path: path.slice(root.length + 1).replaceAll('\\', '/'),
+          size: metadata.size,
+          mtimeMs: Math.trunc(metadata.mtimeMs),
+        })
+      }
+    }
+  }
+  try {
+    await walk(root)
+    files.sort((a, b) => a.path.localeCompare(b.path))
+    return createHash('sha256').update(JSON.stringify(files)).digest('hex')
+  } catch {
+    return undefined
+  }
+}
+
+export async function getLocalEmbeddingReadiness(modelId: string): Promise<LocalEmbeddingReadiness | undefined> {
+  try {
+    const record = JSON.parse(await readFile(embeddingReadinessPath(modelId), 'utf8')) as Partial<LocalEmbeddingReadiness>
+    const dimensions = record.dimensions
+    if (record.schemaVersion !== 1 || record.modelId !== modelId || !Number.isInteger(dimensions) || dimensions === undefined || dimensions <= 0
+      || typeof record.fingerprint !== 'string' || typeof record.validatedAt !== 'number' || typeof record.runtime?.node !== 'string'
+      || record.runtime.transformers !== '3.7.x' || record.runtime.onnxruntime !== '1.21.0') return undefined
+    const fingerprint = await localModelFingerprint(modelId)
+    return fingerprint !== undefined && fingerprint === record.fingerprint ? record as LocalEmbeddingReadiness : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function writeLocalEmbeddingReadiness(modelId: string, dimensions: number): Promise<void> {
+  const fingerprint = await localModelFingerprint(modelId)
+  if (fingerprint === undefined || dimensions <= 0) return
+  const record: LocalEmbeddingReadiness = {
+    schemaVersion: 1,
+    modelId,
+    fingerprint,
+    dimensions,
+    validatedAt: Date.now(),
+    runtime: { node: process.versions.node, transformers: '3.7.x', onnxruntime: '1.21.0' },
+  }
+  const destination = embeddingReadinessPath(modelId)
+  const temporary = `${destination}.tmp-${process.pid}-${Date.now()}`
+  await writeFile(temporary, `${JSON.stringify(record)}\n`, 'utf8')
+  await rename(temporary, destination)
+}
+
+// Embeddings run in a disposable child process rather than a worker thread.
+// That gives a crashed or wedged native ONNX binding a genuinely fresh process
+// on every recovery, while local reranking keeps its own independent child.
 let localWorkerIdleTimeoutMs = 60_000
 const LOCAL_WORKER_REQUEST_TIMEOUT_MS = 30 * 60_000
-/** How long removeLocalModel waits for the worker's release ack before deleting. */
 const LOCAL_RELEASE_ACK_TIMEOUT_MS = 3000
-/** How long cancelLocalModel waits for the worker's cancel ack before deleting. */
-const LOCAL_CANCEL_ACK_TIMEOUT_MS = 3000
+const LOCAL_PROCESS_MAX_PENDING = 16
 
-/** Configure the local-model worker idle release timeout (0 = never release). */
+/** Configure the local-model process idle release timeout (0 = never release). */
 export function setLocalWorkerIdleTimeoutMs(ms: number): void {
   localWorkerIdleTimeoutMs = Number.isFinite(ms) && ms >= 0 ? Math.trunc(ms) : 60_000
   clearIdleTimer()
   if (localWorkerIdleTimeoutMs > 0 && localWorker !== null) armIdleTimer()
 }
 
-let localWorker: Worker | null = null
+let localWorker: ChildProcess | null = null
 let localWorkerIdleTimer: ReturnType<typeof setTimeout> | null = null
 let localRequestSeq = 0
-const localPending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
-/** Resolvers awaiting a worker `released` ack per model (file-lock-safe deletion). */
-const localReleasedWaiters = new Map<string, Array<() => void>>()
-/** Resolvers awaiting a worker `cancelled` ack per model (download truly aborted). */
-const localCancelledWaiters = new Map<string, Array<() => void>>()
+let localActiveModelId: string | null = null
+const localPending = new Map<number, {
+  operation: LocalEmbedOperation
+  expectedCount?: number
+  resolve: (value: unknown) => void
+  reject: (error: Error) => void
+}>()
 
 function localWorkerPath(): string {
-  return fileURLToPath(new URL('./embed-worker.mjs', import.meta.url))
+  return fileURLToPath(new URL('./embed-process.mjs', import.meta.url))
+}
+
+function stagingCacheDir(): string {
+  return join(localModelCacheDir(), '.staging')
+}
+
+function stagingModelPath(modelId: string): string {
+  return join(stagingCacheDir(), modelId)
 }
 
 function clearIdleTimer(): void {
@@ -238,21 +324,22 @@ function failAllPending(error: Error): void {
   localPending.clear()
 }
 
-function ensureLocalWorker(): Worker {
+function ensureLocalWorker(): ChildProcess {
   if (localWorker !== null) return localWorker
-  // Note: --expose-gc is NOT in Node's worker execArgv allowlist (workers
-  // cannot force a major GC), so model memory after pipeline.dispose() is
-  // reclaimed by V8's natural major GC (heap-pressure driven). The heap
-  // settles after a few unload/reload cycles (verified under stress).
-  const worker = new Worker(localWorkerPath())
+  const worker = fork(localWorkerPath(), [], {
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    // Test runners and `--input-type` cannot be forwarded to a child that
+    // executes an ESM file. The process needs no debugger inheritance either.
+    execArgv: process.execArgv.filter(arg => !arg.startsWith('--input-type') && !arg.startsWith('--inspect')),
+  })
   worker.unref()
-  worker.on('message', (message: WorkerResponse): void => {
-    if (message.type === 'progress' && message.modelId !== undefined) {
+  worker.on('message', (message: unknown): void => {
+    if (isLocalEmbedProgress(message)) {
       localModelStatus.set(message.modelId, {
         model: message.modelId,
-        status: message.status ?? 'idle',
-        progress: message.progress ?? 0,
-        message: message.message ?? '',
+        status: message.status,
+        progress: message.progress,
+        message: message.message,
       })
       // A download/load can run for minutes (585MB model); each progress
       // report is proof the worker is alive, so keep the idle-release timer
@@ -261,28 +348,40 @@ function ensureLocalWorker(): Worker {
       armIdleTimer()
       return
     }
-    if (message.type === 'released' && message.modelId !== undefined) {
-      const waiters = localReleasedWaiters.get(message.modelId)
-      if (waiters !== undefined) {
-        localReleasedWaiters.delete(message.modelId)
-        for (const resolve of waiters) resolve()
+    if (!isLocalEmbedResponse(message)) {
+      const id = message !== null && typeof message === 'object' ? (message as { id?: unknown }).id : undefined
+      if (typeof id !== 'number') return
+      const pending = localPending.get(id)
+      if (pending !== undefined) {
+        localPending.delete(id)
+        pending.reject(new Error('local embedding process returned an invalid response envelope'))
+        void terminateLocalWorker(new Error('local embedding process returned an invalid response envelope'))
       }
       return
     }
-    if (message.type === 'cancelled' && message.modelId !== undefined) {
-      const waiters = localCancelledWaiters.get(message.modelId)
-      if (waiters !== undefined) {
-        localCancelledWaiters.delete(message.modelId)
-        for (const resolve of waiters) resolve()
-      }
-      return
-    }
-    if (message.id === undefined) return
     const pending = localPending.get(message.id)
     if (pending === undefined) return
     localPending.delete(message.id)
-    if (message.ok === true) pending.resolve(message.scores ?? message.vectors ?? null)
-    else pending.reject(new Error(message.error ?? 'local model worker failed'))
+    if (message.operation !== pending.operation) {
+      pending.reject(new Error('local embedding process returned an invalid response operation'))
+      void terminateLocalWorker(new Error('local embedding process returned an invalid response operation'))
+      return
+    }
+    if (message.ok === false) {
+      pending.reject(new Error(`${message.error.code}: ${message.error.message}`))
+      return
+    }
+    try {
+      if (pending.operation === 'embed') {
+        pending.resolve(validateEmbeddingResponse(message, pending.expectedCount ?? 0))
+      } else {
+        pending.resolve(undefined)
+      }
+    } catch (error) {
+      const invalid = error instanceof Error ? error : new Error(String(error))
+      pending.reject(invalid)
+      void terminateLocalWorker(invalid)
+    }
   })
   const onWorkerFailure = (error: Error): void => {
     // Ignore a superseded worker's late error/exit — a newer worker may be live.
@@ -292,9 +391,25 @@ function ensureLocalWorker(): Worker {
     clearIdleTimer()
   }
   worker.on('error', (error) => onWorkerFailure(error instanceof Error ? error : new Error(String(error))))
-  worker.on('exit', () => onWorkerFailure(new Error('local model worker exited')))
+  worker.on('exit', (code, signal) => onWorkerFailure(new Error(`local embedding process exited (${code ?? 'null'}${signal === null ? '' : `, ${signal}`})`)))
   localWorker = worker
   return worker
+}
+
+function validateEmbeddingResponse(response: LocalEmbedResponse, expectedCount: number): number[][] {
+  const vectors = response.ok === true ? response.vectors : undefined
+  if (!Array.isArray(vectors) || vectors.length !== expectedCount) {
+    throw new Error('local embedding process returned an invalid vector count')
+  }
+  let dimension: number | undefined
+  for (const vector of vectors) {
+    if (!Array.isArray(vector) || vector.length === 0 || vector.some(value => !Number.isFinite(value))) {
+      throw new Error('local embedding process returned an invalid vector')
+    }
+    if (dimension === undefined) dimension = vector.length
+    else if (vector.length !== dimension) throw new Error('local embedding process returned inconsistent vector dimensions')
+  }
+  return vectors
 }
 
 function armIdleTimer(): void {
@@ -309,19 +424,11 @@ function armIdleTimer(): void {
       armIdleTimer()
       return
     }
-    const worker = localWorker
-    if (worker === null) return
-    // Deep fix: idle release unloads the loaded MODELS (pipeline.dispose frees
-    // the ~600MB ONNX sessions) but KEEPS the worker alive. Terminating and
-    // respawning would re-dlopen onnxruntime's native binding in the same
-    // process, which fails on Linux ("Module did not self-register"). With the
-    // worker alive the binding is loaded exactly once; the next request simply
-    // reloads the model from disk (~1s).
-    try {
-      worker.postMessage({ type: 'release-models' })
-    } catch {
-      // The worker already went away (crash); the next request respawns it.
-    }
+    if (localWorker === null || localActiveModelId === null) return
+    // Release native sessions while retaining the isolated process. A later
+    // hard failure can still terminate the process and start from a clean
+    // ONNX runtime, without ever touching the host process.
+    void callWorker('release', { modelId: localActiveModelId }).catch(() => {})
   }, localWorkerIdleTimeoutMs)
   localWorkerIdleTimer.unref?.()
 }
@@ -329,136 +436,202 @@ function armIdleTimer(): void {
 function postToWorker(message: unknown): void {
   const worker = ensureLocalWorker()
   armIdleTimer()
-  worker.postMessage(message)
+  if (worker.connected !== true || worker.send(message as never) !== true) {
+    throw new Error('local embedding process is not available')
+  }
 }
 
 function callWorker(
-  type: 'embed' | 'load' | 'rerank',
-  payload: { modelId: string; texts?: string[]; query?: string; pooling?: Pooling; task?: 'feature-extraction' | 'reranking' },
+  operation: LocalEmbedOperation,
+  payload: { modelId: string; texts?: string[]; pooling?: Pooling; cacheDir?: string },
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    if (localPending.size >= LOCAL_PROCESS_MAX_PENDING) {
+      reject(new Error('local embedding process is busy'))
+      return
+    }
     const id = ++localRequestSeq
     const timer = setTimeout(() => {
       localPending.delete(id)
-      reject(new Error('local model worker request timed out'))
+      // An expired active inference could be holding a native session in an
+      // unknown state. Destroy only the child, never the DSH host process.
+      void terminateLocalWorker(new Error('local embedding process timed out'))
+      reject(new Error('local embedding process timed out'))
     }, LOCAL_WORKER_REQUEST_TIMEOUT_MS)
     timer.unref?.()
     localPending.set(id, {
+      operation,
+      expectedCount: payload.texts?.length,
       resolve: (value) => { clearTimeout(timer); resolve(value) },
       reject: (error) => { clearTimeout(timer); reject(error) },
     })
-    postToWorker({
+    localActiveModelId = payload.modelId
+    try {
+      postToWorker({
+      protocolVersion: LOCAL_EMBED_PROTOCOL_VERSION,
       id,
-      type,
+      operation,
       modelId: payload.modelId,
-      cacheDir: localModelCacheDir(),
+      cacheDir: payload.cacheDir ?? localModelCacheDir(),
       hfEndpoint: hfEndpointOverride
         ?? (typeof process !== 'undefined' && process.env.HF_ENDPOINT !== undefined ? process.env.HF_ENDPOINT : undefined),
       texts: payload.texts,
-      query: payload.query,
       pooling: payload.pooling,
-      task: payload.task,
-    })
+      })
+    } catch (error) {
+      localPending.delete(id)
+      clearTimeout(timer)
+      reject(error instanceof Error ? error : new Error(String(error)))
+    }
   })
 }
 
 async function embedLocal(modelId: string, texts: readonly string[]): Promise<number[][]> {
-  const vectors = await callWorker('embed', { modelId, texts: [...texts], pooling: poolingFor(modelId) })
-  return vectors as number[][]
+  try {
+    const vectors = await callWorker('embed', { modelId, texts: [...texts], pooling: poolingFor(modelId) }) as number[][]
+    void writeLocalEmbeddingReadiness(modelId, vectors[0]?.length ?? 0).catch(() => {})
+    return vectors
+  } catch (error) {
+    // One clean child restart is safe for a crashed/failed native session.
+    // Do not retry malformed input or a repeatedly failing model indefinitely.
+    if (!isRecoverableLocalProcessError(error)) throw error
+    const vectors = await callWorker('embed', { modelId, texts: [...texts], pooling: poolingFor(modelId) }) as number[][]
+    void writeLocalEmbeddingReadiness(modelId, vectors[0]?.length ?? 0).catch(() => {})
+    return vectors
+  }
 }
 
 /**
  * Local cross-encoder rerank (bge-reranker family): scores each candidate
- * text against the query, index-aligned. Runs in the same worker thread.
+ * text against the query, index-aligned. It deliberately uses the separate
+ * rerank child process so its lifecycle can never disturb embeddings.
  */
 export async function rerankLocal(modelId: string, query: string, texts: readonly string[]): Promise<number[]> {
-  const scores = await callWorker('rerank', { modelId, query, texts: [...texts], task: 'reranking' })
-  return scores as number[]
+  return await rerankInLocalProcess(
+    modelId,
+    localModelCacheDir(),
+    hfEndpointOverride ?? process.env.HF_ENDPOINT,
+    query,
+    texts,
+    60_000,
+  )
 }
 
-/** Download + load a local model in the worker (no inference; progress reports via /local-model-status). */
+/** Download + load a local model in an isolated process (no inference). */
 export async function loadLocalModel(modelId: string, task: 'feature-extraction' | 'reranking' = 'feature-extraction'): Promise<void> {
-  await callWorker('load', { modelId, task })
+  if (task === 'reranking') {
+    await loadLocalReranker(modelId, localModelCacheDir(), hfEndpointOverride ?? process.env.HF_ENDPOINT)
+    return
+  }
+  // A previous completed model is loaded and probed in the child on first
+  // use. New downloads are isolated in `.staging`, so cancellation or a
+  // network fault can never turn a formerly usable model into a partial one.
+  if (await isLocalModelDownloaded(modelId)) {
+    await callWorker('load', { modelId })
+    const probe = await callWorker('embed', { modelId, texts: ['dsh local embedding readiness probe'], pooling: poolingFor(modelId) }) as number[][]
+    await writeLocalEmbeddingReadiness(modelId, probe[0]?.length ?? 0)
+    return
+  }
+  const staging = stagingCacheDir()
+  localModelStatus.set(modelId, { model: modelId, status: 'downloading', progress: 0, message: '' })
+  await callWorker('download', { modelId, cacheDir: staging })
+  if (!(await isDownloadedAt(stagingModelPath(modelId)))) {
+    throw new Error('local embedding process completed without a valid model cache')
+  }
+  // The process holds its staging pipeline open. Release it before the atomic
+  // promotion, which avoids a Windows file lock and guarantees the final
+  // cache is either the old complete model or the new complete model.
+  await callWorker('release', { modelId, cacheDir: staging })
+  const finalPath = join(localModelCacheDir(), modelId)
+  await mkdir(dirname(finalPath), { recursive: true })
+  await rm(finalPath, { recursive: true, force: true })
+  await rename(stagingModelPath(modelId), finalPath)
+  await callWorker('load', { modelId })
+  const probe = await callWorker('embed', { modelId, texts: ['dsh local embedding readiness probe'], pooling: poolingFor(modelId) }) as number[][]
+  await writeLocalEmbeddingReadiness(modelId, probe[0]?.length ?? 0)
 }
 
-/** Cancel an in-flight download; the next progress tick throws and aborts the load. */
+async function isDownloadedAt(modelRoot: string): Promise<boolean> {
+  try {
+    const [config, onnxEntries, tokenizer] = await Promise.all([
+      stat(join(modelRoot, 'config.json')),
+      readdir(join(modelRoot, 'onnx')),
+      Promise.any([
+        stat(join(modelRoot, 'tokenizer.json')),
+        stat(join(modelRoot, 'tokenizer_config.json')),
+        stat(join(modelRoot, 'vocab.txt')),
+        stat(join(modelRoot, 'spiece.model')),
+      ]),
+    ])
+    if (config.size <= 0 || tokenizer.size <= 0) return false
+    for (const name of onnxEntries) {
+      if (name.endsWith('.onnx') && (await stat(join(modelRoot, 'onnx', name))).size > 0) return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+/** Cancel only an active download. A previously ready model is never removed. */
 export async function cancelLocalModel(modelId: string): Promise<void> {
-  postToWorker({ type: 'cancel', modelId })
+  if (localModelStatus.get(modelId)?.status !== 'downloading') return
+  await terminateLocalWorker(new Error('local embedding download cancelled'))
   localModelStatus.set(modelId, { model: modelId, status: 'idle', progress: 0, message: '' })
-  // Wait for the worker to acknowledge the download actually aborted (its
-  // file handles released) before removing the files: an eager rm races the
-  // last write — on Windows the unlink fails on the locked file and leaves a
-  // half-written directory that `isDownloaded` then mistakes for a complete
-  // model, so retry fails forever.
-  await waitForCancelAck(modelId)
-  await rm(join(localModelCacheDir(), modelId), { recursive: true, force: true }).catch(() => {})
+  await rm(join(localModelCacheDir(), '.staging', modelId), { recursive: true, force: true }).catch(() => {})
 }
 
-/** Wait (bounded) for the worker's `cancelled` ack; always resolves. */
-function waitForCancelAck(modelId: string): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const done = (): void => resolve()
-    const waiters = localCancelledWaiters.get(modelId) ?? []
-    waiters.push(done)
-    localCancelledWaiters.set(modelId, waiters)
-    const timer = setTimeout(() => {
-      const current = localCancelledWaiters.get(modelId) ?? []
-      const index = current.indexOf(done)
-      if (index >= 0) {
-        current.splice(index, 1)
-        if (current.length === 0) localCancelledWaiters.delete(modelId)
-      }
-      resolve()
-    }, LOCAL_CANCEL_ACK_TIMEOUT_MS)
-    timer.unref?.()
-  })
-}
-
-/** Drop a loaded extractor (frees its ~600MB in the worker) and delete its cached weights from disk. */
+/** Drop a loaded extractor (frees its native sessions) and delete its cached weights. */
 export async function removeLocalModel(modelId: string): Promise<void> {
   if (localModelStatus.get(modelId)?.status === 'downloading') {
     throw new Error('模型正在下载，完成后才能删除')
   }
-  postToWorker({ type: 'release', modelId })
-  // Wait for the worker's release ack so onnxruntime can close its file
-  // handles before the files are removed (a Windows mmap lock would make rm
-  // fail). Time out after a short grace period rather than blocking forever.
-  await new Promise<void>((resolve) => {
-    const done = (): void => resolve()
-    const waiters = localReleasedWaiters.get(modelId) ?? []
-    waiters.push(done)
-    localReleasedWaiters.set(modelId, waiters)
-    const timer = setTimeout(() => {
-      const current = localReleasedWaiters.get(modelId) ?? []
-      const index = current.indexOf(done)
-      if (index >= 0) {
-        current.splice(index, 1)
-        if (current.length === 0) localReleasedWaiters.delete(modelId)
-      }
-      resolve()
-    }, LOCAL_RELEASE_ACK_TIMEOUT_MS)
-    timer.unref?.()
-  })
+  await withTimeout(callWorker('release', { modelId }), LOCAL_RELEASE_ACK_TIMEOUT_MS).catch(() => {})
   localModelStatus.delete(modelId)
   await rm(join(localModelCacheDir(), modelId), { recursive: true, force: true })
 }
 
-/** Terminate the worker (plugin teardown). Idempotent; resolves once the
- *  worker thread has actually exited so callers can then move/delete the
- *  cached weights without a Windows mmap file lock blocking the operation. */
+async function terminateLocalWorker(error: Error): Promise<void> {
+  const worker = localWorker
+  localWorker = null
+  localActiveModelId = null
+  clearIdleTimer()
+  failAllPending(error)
+  if (worker === null) return
+  const processToStop = worker
+  await new Promise<void>(resolve => {
+    const timer = setTimeout(done, LOCAL_RELEASE_ACK_TIMEOUT_MS)
+    timer.unref?.()
+    function done(): void {
+      clearTimeout(timer)
+      processToStop.removeListener('exit', done)
+      resolve()
+    }
+    processToStop.once('exit', done)
+    try { processToStop.kill('SIGTERM') } catch { done() }
+  })
+}
+
+function isRecoverableLocalProcessError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /process (?:exited|timed out|is not available)|process_crash|runtime_error/i.test(message)
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('local embedding operation timed out')), timeoutMs)
+    timer.unref?.()
+    promise.then(value => { clearTimeout(timer); resolve(value) }, error => { clearTimeout(timer); reject(error) })
+  })
+}
+
+/** Gracefully terminate the isolated embedding process during plugin teardown. */
 export async function disposeLocalModelWorker(): Promise<void> {
   clearIdleTimer()
   const worker = localWorker
-  localWorker = null
-  failAllPending(new Error('local model worker disposed'))
-  if (worker !== null) {
-    try {
-      worker.postMessage({ type: 'shutdown' })
-    } catch {
-      // worker already dead — nothing to do
-    }
-    await worker.terminate()
-  }
+  if (worker === null) return
+  await withTimeout(callWorker('shutdown', { modelId: localActiveModelId ?? '' }), LOCAL_RELEASE_ACK_TIMEOUT_MS).catch(() => {})
+  if (localWorker === worker) await terminateLocalWorker(new Error('local embedding process disposed'))
 }
 
 /** Whether any local model download is currently in flight (migration guard). */
