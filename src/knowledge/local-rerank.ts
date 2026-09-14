@@ -71,6 +71,7 @@ let queue: QueueEntry[] = []
 let requestSequence = 0
 let idleTimer: ReturnType<typeof setTimeout> | null = null
 let intentionalExit = false
+let childGeneration = 0
 let progressListener: ((event: LocalRerankProgressEvent) => void) | undefined
 
 function abortError(signal: AbortSignal): Error {
@@ -141,7 +142,11 @@ function finishActive(error: Error | undefined, value?: unknown): void {
   queueMicrotask(pump)
 }
 
-function onMessage(message: unknown): void {
+function onMessage(message: unknown, generation: number): void {
+  // Child IPC can deliver a final progress event after a timeout or idle
+  // teardown. Never let an obsolete child overwrite the status of its newer
+  // replacement (#18).
+  if (generation !== childGeneration) return
   if (isProgressEvent(message)) {
     progressListener?.(message)
     return
@@ -171,6 +176,7 @@ function onMessage(message: unknown): void {
 function spawnChild(): ChildProcess {
   if (child !== null) return child
   intentionalExit = false
+  const generation = ++childGeneration
   const spawned = fork(processPath(), [], {
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
     // Host-only eval/test/debug flags can make a file-based fork fail or make
@@ -180,7 +186,7 @@ function spawnChild(): ChildProcess {
       && !argument.startsWith('--input-type')
       && !argument.startsWith('--inspect')),
   })
-  spawned.on('message', onMessage)
+  spawned.on('message', message => onMessage(message, generation))
   spawned.on('error', error => {
     if (child !== spawned || intentionalExit) return
     child = null
@@ -203,9 +209,10 @@ function terminateChild(): void {
   clearIdleTimer()
   const running = child
   child = null
+  childGeneration += 1
   if (running === null) return
   intentionalExit = true
-  running.removeListener('message', onMessage)
+  running.removeAllListeners('message')
   running.kill('SIGKILL')
 }
 
