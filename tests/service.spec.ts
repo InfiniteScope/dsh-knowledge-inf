@@ -362,6 +362,26 @@ describe('KnowledgeService', () => {
     expect(result.elapsedMs).toBeGreaterThanOrEqual(0)
   })
 
+  it('reports the effective retrieval lanes and visible score meaning without inspecting one hit', async () => {
+    const service = await mountService()
+    const base = await service.createBase({ name: 'retrieval-contract' })
+    await service.addTextDocument({ baseId: base.id, title: 'd', content: 'invoice approval workflow' })
+
+    const single = await service.search({ query: 'invoice', baseId: base.id, mode: 'auto' })
+    expect(single.mode).toBe('lexical')
+    expect(single.scoreKind).toBe('lexical_relevance')
+    expect(single.retrieval).toMatchObject({
+      requestedMode: 'auto', effectiveMode: 'lexical',
+      lexical: { attempted: true, succeeded: true, returnedCount: 1 },
+      vector: { attempted: false, succeeded: false, returnedCount: 0 },
+    })
+
+    const multi = await service.search({ query: 'invoice', queries: ['approval'], baseId: base.id, mode: 'auto' })
+    expect(multi.mode).toBe('lexical')
+    expect(multi.scoreKind).toBe('rrf')
+    expect(multi.retrieval?.lexical).toMatchObject({ attempted: true, succeeded: true, returnedCount: 2 })
+  })
+
   it('propagates owner cancellation through remote embedding without lexical fallback', async () => {
     const service = await mountService()
     const base = await service.createBase({ name: 'embedding-abort' })
@@ -1252,9 +1272,12 @@ describe('KnowledgeService', () => {
     mkdirSync(qwenOnnx, { recursive: true })
     writeFileSync(join(qwenOnnx, 'model_quantized.onnx'), 'fake weights')
     writeFileSync(join(from, 'onnx-community', 'Qwen3-Embedding-0.6B-ONNX', 'config.json'), '{}')
+    writeFileSync(join(from, 'onnx-community', 'Qwen3-Embedding-0.6B-ONNX', 'tokenizer.json'), '{}')
     const bgeOnnx = join(from, 'Xenova', 'bge-small-zh-v1.5', 'onnx')
     mkdirSync(bgeOnnx, { recursive: true })
     writeFileSync(join(bgeOnnx, 'model_quantized.onnx'), 'fake weights')
+    writeFileSync(join(from, 'Xenova', 'bge-small-zh-v1.5', 'config.json'), '{}')
+    writeFileSync(join(from, 'Xenova', 'bge-small-zh-v1.5', 'tokenizer.json'), '{}')
     mkdirSync(join(from, 'ocr'), { recursive: true })
     writeFileSync(join(from, 'ocr', 'ppocrv5_det.onnx'), 'x')
     const { setLocalModelCacheDir, isLocalModelDownloaded } = await import('../src/knowledge/embed.js')

@@ -75,8 +75,10 @@ import type {
   KnowledgeDocument,
   SearchHit,
   SearchMode,
+  SearchScoreKind,
   SearchRequest,
   SearchResult,
+  RetrievalStatus,
   RerankErrorDetail,
   RerankStatus,
   UpdateBaseRequest,
@@ -201,6 +203,15 @@ interface BackgroundJob {
   done: boolean
 }
 
+interface IndexingFailure {
+  readonly baseId: string
+  readonly title: string
+  readonly phase: 'parsing' | 'embedding'
+  readonly code: string
+  readonly message: string
+  readonly expireAt: number
+}
+
 /** Raised by same-name conflict detection (`conflict: 'detect'`); the HTTP
  *  layer maps it to 409 Conflict so callers can re-submit with a strategy. */
 export class ConflictError extends Error {
@@ -224,6 +235,7 @@ export class KnowledgeService extends Service {
    * every guard still consults {@link indexing}, never this map.
    */
   private readonly progressLinger = new Map<string, { baseId: string; title: string; phase: 'parsing' | 'embedding'; progress: number; expireAt: number }>()
+  private readonly indexingFailures = new Map<string, IndexingFailure>()
   // Cherry Studio parity: per-base worker pool (Cherry's knowledge jobs run at
   // defaultConcurrency 5 on a per-base queue). Rows are created up front and
   // flip status as the queued parse+ingest tasks run in the background.
@@ -847,6 +859,7 @@ export class KnowledgeService extends Service {
     // The task's abort controller: a delete of the row or base aborts the
     // in-flight MinerU batch and embedding requests (Cherry's job cancel).
     const taskController = new AbortController()
+    this.indexingFailures.delete(docId)
     this.indexing.set(docId, { baseId: request.baseId, title, phase: 'parsing', total: 0, progress: 0, controller: taskController })
     // Queue the background parse+ingest. The task re-reads the persisted raw
     // copy instead of holding the payload in memory, so a large batch never
@@ -923,6 +936,14 @@ export class KnowledgeService extends Service {
         // was queued or running — never resurrect it (Cherry's deleting-guard).
         const current = store.getDocument(docId)
         if (current === undefined || store.getBase(request.baseId) === undefined) return
+        this.indexingFailures.set(docId, {
+          baseId: request.baseId,
+          title,
+          phase: 'parsing',
+          code: 'parse_failed',
+          message: safeIndexingErrorMessage(message),
+          expireAt: Date.now() + PROGRESS_LINGER_TTL_MS,
+        })
         try {
           await store.putDocument({ ...current, embeddingError: message, errorCode: 'parse_failed', updatedAt: Date.now() })
         } catch {
@@ -2022,10 +2043,16 @@ export class KnowledgeService extends Service {
     return { baseId, totalItems: summaries.length, nodes }
   }
 
-  /** Live import/embedding progress for every document currently being indexed. */
-  indexingStatus(): Array<{ docId: string; baseId: string; title: string; phase: 'parsing' | 'embedding'; progress: number }> {
+  /** Live progress plus recent terminal failures for client-side recovery. */
+  indexingStatus(): Array<
+    | { docId: string; baseId: string; title: string; phase: 'parsing' | 'embedding'; progress: number; status?: 'running' }
+    | { docId: string; baseId: string; title: string; phase: 'parsing' | 'embedding'; progress: number; status: 'failed'; error: { code: string; message: string } }
+  > {
     const now = Date.now()
-    const out: Array<{ docId: string; baseId: string; title: string; phase: 'parsing' | 'embedding'; progress: number }> = []
+    const out: Array<
+      | { docId: string; baseId: string; title: string; phase: 'parsing' | 'embedding'; progress: number; status?: 'running' }
+      | { docId: string; baseId: string; title: string; phase: 'parsing' | 'embedding'; progress: number; status: 'failed'; error: { code: string; message: string } }
+    > = []
     for (const [docId, entry] of this.indexing) {
       out.push({ docId, baseId: entry.baseId, title: entry.title, phase: entry.phase, progress: entry.progress })
     }
@@ -2037,6 +2064,21 @@ export class KnowledgeService extends Service {
         continue
       }
       out.push({ docId, baseId: entry.baseId, title: entry.title, phase: entry.phase, progress: entry.progress })
+    }
+    for (const [docId, failure] of [...this.indexingFailures]) {
+      if (failure.expireAt <= now) {
+        this.indexingFailures.delete(docId)
+        continue
+      }
+      out.push({
+        docId,
+        baseId: failure.baseId,
+        title: failure.title,
+        phase: failure.phase,
+        progress: 0,
+        status: 'failed',
+        error: { code: failure.code, message: failure.message },
+      })
     }
     return out
   }
@@ -2475,7 +2517,7 @@ export class KnowledgeService extends Service {
     throwIfAborted(execution.signal)
     throwIfDeadline(execution.deadlineAt)
     const query = request.query.trim()
-    if (query.length === 0) return { query, mode: 'lexical', total: 0, reranked: false, elapsedMs: 0, hits: [] }
+    if (query.length === 0) return emptySearchResult(query, request.mode ?? 'lexical', 0)
     if (query.length > 2000) throw new Error('search query must not exceed 2000 characters')
 
     const variants = normalizeQueryVariants(query, request.queries)
@@ -2512,16 +2554,16 @@ export class KnowledgeService extends Service {
     const store = this.requireStore()
     const config = this.getConfigFor(request.baseId)
     const query = request.query.trim()
-    if (query.length === 0) return { query, mode: 'lexical', total: 0, reranked: false, elapsedMs: 0, hits: [] }
+    if (query.length === 0) return emptySearchResult(query, request.mode ?? config.searchMode, 0)
     const requestedMode = request.mode ?? config.searchMode
     const topK = clampInt(request.topK ?? config.topK, 1, 50, 6)
     if (request.baseId === undefined && request.baseIds !== undefined && request.baseIds.length === 0) {
-      return { query, mode: 'lexical', total: 0, reranked: false, elapsedMs: Date.now() - startedAt, hits: [] }
+      return emptySearchResult(query, requestedMode, Date.now() - startedAt)
     }
     // A stale base id (e.g. a base deleted without sweeping child records)
     // must not surface orphaned content.
     if (request.baseId !== undefined && store.getBase(request.baseId) === undefined) {
-      return { query, mode: 'lexical', total: 0, reranked: false, elapsedMs: 0, hits: [] }
+      return emptySearchResult(query, requestedMode, 0)
     }
 
     const threshold = request.threshold ?? config.similarityThreshold
@@ -2533,7 +2575,7 @@ export class KnowledgeService extends Service {
     // Never pass it to a storage implementation that might interpret [] as
     // unrestricted scope.
     if (filterDocIds !== undefined && filterDocIds.size === 0) {
-      return { query, mode: 'lexical', total: 0, reranked: false, elapsedMs: Date.now() - startedAt, hits: [] }
+      return emptySearchResult(query, requestedMode, Date.now() - startedAt)
     }
 
     const lane = store.retrievalLane
@@ -2578,38 +2620,82 @@ export class KnowledgeService extends Service {
       let ranked: RankedHit[] = []
       const byId = new Map<string, KnowledgeChunk>()
       let total = 0
+      let vectorAttempted = false
+      let vectorSucceeded = false
+      let vectorReturned = 0
+      let vectorError: string | undefined
+      let lexicalAttempted = false
+      let lexicalSucceeded = false
+      let lexicalReturned = 0
+      let lexicalError: string | undefined
+
+      let vec: Awaited<ReturnType<typeof lane.vector>> | undefined
       if (useVector) {
-        const vec = await lane.vector(queryVector!, scope, poolSize, filterList, deadlineAt)
-        total = Math.max(total, vec.total)
-        for (const hit of vec.hits) byId.set(hit.id, hit)
-        if (requestedMode === 'vector') {
-          ranked = vec.hits.map(hit => ({ id: hit.id, score: hit.score, vectorScore: hit.score }))
-        } else {
-          // Hybrid/auto: fuse both lanes with Reciprocal Rank Fusion; the
-          // vector lane carries the configured relative weight.
-          const lex = await lane.lexical(query, scope, poolSize, filterList, deadlineAt)
+        vectorAttempted = true
+        try {
+          vec = await lane.vector(queryVector!, scope, poolSize, filterList, deadlineAt)
+          vectorSucceeded = true
+          vectorReturned = vec.hits.length
+          total = Math.max(total, vec.total)
+          for (const hit of vec.hits) byId.set(hit.id, hit)
+        } catch (error) {
+          vectorError = retrievalErrorCode(error)
+          this.ctx.logger.warn(`knowledge: vector retrieval failed, using lexical retrieval: ${safeErrorMessage(error)}`)
+        }
+      } else if (requestedMode !== 'lexical' && config.embeddingProvider !== 'none' && queryVector === undefined) {
+        vectorError = 'embedding_unavailable'
+      }
+
+      // Hybrid/auto always execute lexical when vector worked, even when the
+      // vector lane returned zero rows: a successful empty lane is distinct
+      // from a failed lane in the public contract.
+      let lex: Awaited<ReturnType<typeof lane.lexical>> | undefined
+      if (requestedMode !== 'vector' || vec === undefined) {
+        lexicalAttempted = true
+        try {
+          lex = await lane.lexical(query, scope, poolSize, filterList, deadlineAt)
+          lexicalSucceeded = true
+          lexicalReturned = lex.hits.length
           total = Math.max(total, lex.total)
           for (const hit of lex.hits) if (!byId.has(hit.id)) byId.set(hit.id, hit)
-          const vectorOrder = vec.hits.map(hit => hit.id)
-          const lexicalOrder = lex.hits.map(hit => hit.id)
-          const vectorWeight = config.rrfVectorWeight
-          const fused = reciprocalRankFusion([vectorOrder, lexicalOrder], [vectorWeight, 1])
-          const maxFused = (vectorWeight + 1) / (RRF_K + 1)
-          const vectorScores = new Map(vec.hits.map(hit => [hit.id, hit.score]))
-          const lexicalScores = new Map(lex.hits.map(hit => [hit.id, hit.score]))
-          ranked = [...new Set([...vectorOrder, ...lexicalOrder])].map(id => ({
-            id,
-            score: (fused.get(id) ?? 0) / maxFused,
-            vectorScore: vectorScores.get(id),
-            lexicalScore: lexicalScores.get(id),
-          }))
+        } catch (error) {
+          lexicalError = retrievalErrorCode(error)
+          this.ctx.logger.warn(`knowledge: lexical retrieval failed: ${safeErrorMessage(error)}`)
         }
-      } else {
-        const lex = await lane.lexical(query, scope, poolSize, filterList, deadlineAt)
-        total = lex.total
-        for (const hit of lex.hits) byId.set(hit.id, hit)
+      }
+
+      if (vec !== undefined && lex !== undefined) {
+        // Hybrid/auto: fuse both lanes with Reciprocal Rank Fusion; the vector
+        // lane carries the configured relative weight.
+        const vectorOrder = vec.hits.map(hit => hit.id)
+        const lexicalOrder = lex.hits.map(hit => hit.id)
+        const vectorWeight = config.rrfVectorWeight
+        const fused = reciprocalRankFusion([vectorOrder, lexicalOrder], [vectorWeight, 1])
+        const maxFused = (vectorWeight + 1) / (RRF_K + 1)
+        const vectorScores = new Map(vec.hits.map(hit => [hit.id, hit.score]))
+        const lexicalScores = new Map(lex.hits.map(hit => [hit.id, hit.score]))
+        ranked = [...new Set([...vectorOrder, ...lexicalOrder])].map(id => ({
+          id,
+          score: (fused.get(id) ?? 0) / maxFused,
+          vectorScore: vectorScores.get(id),
+          lexicalScore: lexicalScores.get(id),
+        }))
+      } else if (vec !== undefined) {
+        ranked = vec.hits.map(hit => ({ id: hit.id, score: hit.score, vectorScore: hit.score }))
+      } else if (lex !== undefined) {
         ranked = lex.hits.map(hit => ({ id: hit.id, score: hit.score, lexicalScore: hit.score }))
       }
+      const laneStatus = retrievalStatus(requestedMode, {
+        attempted: lexicalAttempted,
+        succeeded: lexicalSucceeded,
+        returnedCount: lexicalReturned,
+        ...(lexicalError !== undefined ? { errorCode: lexicalError } : {}),
+      }, {
+        attempted: vectorAttempted,
+        succeeded: vectorSucceeded,
+        returnedCount: vectorReturned,
+        ...(vectorError !== undefined ? { errorCode: vectorError } : {}),
+      })
 
       ranked.sort((a, b) => b.score - a.score)
       if (request.mmr ?? config.mmrDiversity > 0) {
@@ -2618,7 +2704,7 @@ export class KnowledgeService extends Service {
         }
       }
       throwIfAborted(signal)
-      return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, total, startedAt, allowRerank, signal)
+      return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, total, startedAt, allowRerank, signal, laneStatus)
     }
 
     const chunks = (request.baseId !== undefined
@@ -2627,7 +2713,7 @@ export class KnowledgeService extends Service {
         ? request.baseIds.flatMap(id => store.listChunks(id))
         : store.listBases().flatMap(base => store.listChunks(base.id)))
       .filter(chunk => filterDocIds === undefined || filterDocIds.has(chunk.docId))
-    if (chunks.length === 0) return { query, mode: 'lexical', total: 0, reranked: false, elapsedMs: 0, hits: [] }
+    if (chunks.length === 0) return emptySearchResult(query, requestedMode, 0)
 
     const byId = new Map(chunks.map(chunk => [chunk.id, chunk]))
     const candidates = chunks.map(chunk => ({
@@ -2671,7 +2757,16 @@ export class KnowledgeService extends Service {
       queryVector,
     })
     throwIfAborted(signal)
-    return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, chunks.length, startedAt, allowRerank, signal)
+    const retrieval = retrievalStatus(
+      requestedMode,
+      { attempted: true, succeeded: true, returnedCount: ranked.filter(hit => hit.lexicalScore !== undefined).length },
+      {
+        attempted: requestedMode !== 'lexical' && config.embeddingProvider !== 'none',
+        succeeded: queryVector !== undefined,
+        returnedCount: ranked.filter(hit => hit.vectorScore !== undefined).length,
+      },
+    )
+    return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, chunks.length, startedAt, allowRerank, signal, retrieval)
   }
 
   /** Merge independent query rankings with RRF, then optionally rerank once. */
@@ -2702,17 +2797,16 @@ export class KnowledgeService extends Service {
     const applied = await this.applyRerank(store, config, query, hits, topK, allowRerank, signal)
     hits = applied.hits
 
-    const mode = results.some(result => result.mode === 'hybrid')
-      ? 'hybrid'
-      : results.some(result => result.mode === 'vector')
-        ? 'vector'
-        : requestedMode === 'lexical' ? 'lexical' : results[0]?.mode ?? 'lexical'
+    const retrieval = combineRetrievalStatus(requestedMode, results)
+    const mode = retrieval.effectiveMode
     const threshold = requestedThreshold ?? config.similarityThreshold
     if (applied.reranked || mode === 'vector') hits = hits.filter(hit => hit.score >= threshold)
     const finalHits = attachContextWindows(store, hits.slice(0, topK), query, config.siblingChunks, SEARCH_EVIDENCE_TOKENS)
     return {
       query,
       mode,
+      scoreKind: applied.reranked ? 'rerank' : 'rrf',
+      retrieval,
       total: results.reduce((max, result) => Math.max(max, result.total), 0),
       reranked: applied.reranked,
       ...(applied.rerank !== undefined ? { rerank: applied.rerank } : {}),
@@ -2735,6 +2829,7 @@ export class KnowledgeService extends Service {
     startedAt: number,
     allowRerank = true,
     signal?: AbortSignal,
+    retrieval = retrievalStatusFromRanked(requestedMode, initial),
   ): Promise<SearchResult> {
     throwIfAborted(signal)
     const ranked = initial
@@ -2760,7 +2855,9 @@ export class KnowledgeService extends Service {
 
     return {
       query,
-      mode: effectiveMode(requestedMode, ranked),
+      mode: retrieval.effectiveMode,
+      scoreKind: applied.reranked ? 'rerank' : scoreKindForMode(retrieval.effectiveMode),
+      retrieval,
       total,
       reranked: applied.reranked,
       ...(applied.rerank !== undefined ? { rerank: applied.rerank } : {}),
@@ -3052,6 +3149,7 @@ export class KnowledgeService extends Service {
       await store.putDocument(halfDoc)
       return halfDoc
     })
+    this.indexingFailures.delete(half.id)
     // Chunking (regular or semantic) happens inside buildChunks; passing no
     // pieces lets the configured semanticChunk path run.
     const { chunks, embeddingError, embeddingErrorCode } = await this.buildChunks(input.baseId, half.id, input.title, input.text, config, undefined, batch => store.putChunkBatch(batch), signal)
@@ -3312,12 +3410,108 @@ function embeddingKey(config: KnowledgeConfig): string | undefined {
   return `${config.embeddingProvider}:${model}`
 }
 
-function effectiveMode(requested: SearchMode, ranked: readonly RankedHit[]): SearchMode {
-  if (requested === 'vector' || requested === 'lexical') return requested
-  const hybrid = ranked.some(hit => hit.vectorScore !== undefined && hit.lexicalScore !== undefined)
-  if (requested === 'hybrid') return hybrid ? 'hybrid' : 'lexical'
-  // auto
-  return hybrid ? 'hybrid' : 'lexical'
+/**
+ * Report actual retrieval contribution rather than inspecting whether one
+ * arbitrary final row happened to carry both scores. RRF legitimately admits
+ * one-lane rows, so the old per-row `&&` test misreported vector-only results
+ * as lexical (Issue #16).
+ */
+function retrievalStatusFromRanked(requestedMode: SearchMode, ranked: readonly RankedHit[]): RetrievalStatus {
+  const vectorCount = ranked.reduce((count, hit) => count + (hit.vectorScore !== undefined ? 1 : 0), 0)
+  const lexicalCount = ranked.reduce((count, hit) => count + (hit.lexicalScore !== undefined ? 1 : 0), 0)
+  const vectorRequested = requestedMode === 'vector' || requestedMode === 'hybrid' || requestedMode === 'auto'
+  const lexicalRequested = requestedMode !== 'vector'
+  const effectiveMode: SearchMode = vectorCount > 0 && lexicalCount > 0
+    ? 'hybrid'
+    : vectorCount > 0
+      ? 'vector'
+      : 'lexical'
+  return {
+    requestedMode,
+    effectiveMode,
+    lexical: { attempted: lexicalRequested, succeeded: lexicalCount > 0, returnedCount: lexicalCount },
+    vector: { attempted: vectorRequested, succeeded: vectorCount > 0, returnedCount: vectorCount },
+  }
+}
+
+function retrievalStatus(
+  requestedMode: SearchMode,
+  lexical: RetrievalStatus['lexical'],
+  vector: RetrievalStatus['vector'],
+): RetrievalStatus {
+  const effectiveMode: SearchMode = lexical.succeeded && vector.succeeded
+    ? 'hybrid'
+    : vector.succeeded
+      ? 'vector'
+      : 'lexical'
+  return { requestedMode, effectiveMode, lexical, vector }
+}
+
+function emptyRetrievalStatus(requestedMode: SearchMode): RetrievalStatus {
+  return retrievalStatus(
+    requestedMode,
+    { attempted: false, succeeded: false, returnedCount: 0 },
+    { attempted: false, succeeded: false, returnedCount: 0 },
+  )
+}
+
+function emptySearchResult(query: string, requestedMode: SearchMode, elapsedMs: number): SearchResult {
+  const retrieval = emptyRetrievalStatus(requestedMode)
+  return {
+    query,
+    mode: retrieval.effectiveMode,
+    scoreKind: scoreKindForMode(retrieval.effectiveMode),
+    retrieval,
+    total: 0,
+    reranked: false,
+    elapsedMs,
+    hits: [],
+  }
+}
+
+function combineRetrievalStatus(requestedMode: SearchMode, results: readonly SearchResult[]): RetrievalStatus {
+  const lexical = results.reduce((total, result) => total + (result.retrieval?.lexical.returnedCount ?? 0), 0)
+  const vector = results.reduce((total, result) => total + (result.retrieval?.vector.returnedCount ?? 0), 0)
+  const lexicalAttempted = results.some(result => result.retrieval?.lexical.attempted === true)
+  const vectorAttempted = results.some(result => result.retrieval?.vector.attempted === true)
+  const lexicalSucceeded = results.some(result => result.retrieval?.lexical.succeeded === true)
+  const vectorSucceeded = results.some(result => result.retrieval?.vector.succeeded === true)
+  const lexicalError = results.find(result => result.retrieval?.lexical.errorCode !== undefined)?.retrieval?.lexical.errorCode
+  const vectorError = results.find(result => result.retrieval?.vector.errorCode !== undefined)?.retrieval?.vector.errorCode
+  return retrievalStatus(requestedMode, {
+    attempted: lexicalAttempted,
+    succeeded: lexicalSucceeded,
+    returnedCount: lexical,
+    ...(lexicalError !== undefined ? { errorCode: lexicalError } : {}),
+  }, {
+    attempted: vectorAttempted,
+    succeeded: vectorSucceeded,
+    returnedCount: vector,
+    ...(vectorError !== undefined ? { errorCode: vectorError } : {}),
+  })
+}
+
+function scoreKindForMode(mode: SearchMode): SearchScoreKind {
+  if (mode === 'hybrid') return 'rrf'
+  if (mode === 'vector') return 'vector_similarity'
+  return 'lexical_relevance'
+}
+
+function safeErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function retrievalErrorCode(error: unknown): string {
+  if (error !== null && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string') {
+    return (error as { code: string }).code
+  }
+  return 'lane_error'
+}
+
+function safeIndexingErrorMessage(message: string): string {
+  // Status polling must remain useful without copying document text or a
+  // potentially huge provider payload into the API response.
+  return message.replace(/[\r\n]+/g, ' ').slice(0, 300)
 }
 
 /** Bounded list of a base's top-level sources (directory roots / files / URLs /
