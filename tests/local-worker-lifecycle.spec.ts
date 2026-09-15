@@ -169,7 +169,15 @@ describe('local embedding process lifecycle', () => {
   it('cancels only the staging download and leaves a ready final model untouched', async () => {
     processState.mode = 'hang_download'
     const loading = loadLocalModel('cancel/model').catch(error => error)
-    for (let index = 0; index < 20 && getLocalModelStatus('cancel/model').status !== 'downloading'; index += 1) {
+    // The status flips only after the real "is this model already cached?"
+    // filesystem probe settles, so wait on a wall-clock deadline rather than a
+    // fixed iteration budget: a contended CI runner can need far more
+    // event-loop turns than any small constant allows, and this assertion used
+    // to fail intermittently with 'idle' on the Node 24 quality job. hrtime is
+    // never faked by the timer mock, and advanceTimersByTimeAsync still yields
+    // to the real event loop so the pending fs callbacks can complete.
+    const deadline = process.hrtime.bigint() + 5_000_000_000n
+    while (getLocalModelStatus('cancel/model').status !== 'downloading' && process.hrtime.bigint() < deadline) {
       await vi.advanceTimersByTimeAsync(1)
     }
     expect(getLocalModelStatus('cancel/model').status).toBe('downloading')
