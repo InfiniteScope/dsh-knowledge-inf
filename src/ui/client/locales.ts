@@ -320,6 +320,15 @@ export type KnowledgeKey =
   | 'captionBaseUrlOllamaPlaceholder'
   | 'captionBaseUrlPlaceholder'
   | 'citationSource'
+  | 'confirmCascadeDeleteTitle'
+  | 'confirmCascadeDelete'
+  | 'confirmCascadeBulkDeleteTitle'
+  | 'confirmCascadeBulkDelete'
+  | 'cascadeImpactDirectories'
+  | 'cascadeImpactFiles'
+  | 'cascadeImpactChunks'
+  | 'cascadeImpactSnapshots'
+  | 'cascadeDeleteConfirm'
   | 'error'
 
 /** Bound translate over the knowledge dictionary. */
@@ -594,6 +603,15 @@ export const zh: Record<KnowledgeKey, string> = {
   noResults: '无结果',
   embeddingFailed: '嵌入失败',
   confirmBulkDelete: '删除选中的 {count} 份文档及其全部分块？此操作不可撤销。',
+  confirmCascadeDeleteTitle: '确认级联删除',
+  confirmCascadeDelete: '该目录包含子项，删除会连同整棵子树一并移除。以下内容将被永久删除：',
+  confirmCascadeBulkDeleteTitle: '确认级联删除',
+  confirmCascadeBulkDelete: '选中项中包含非空目录，删除会连同它们的整棵子树一并移除。以下内容将被永久删除：',
+  cascadeImpactDirectories: '目录',
+  cascadeImpactFiles: '文件',
+  cascadeImpactChunks: '分块',
+  cascadeImpactSnapshots: '原始快照',
+  cascadeDeleteConfirm: '级联删除',
   noLocalModels: '暂无本地模型',
   lexicalOnly: '仅关键词',
   lexicalOnlyHint: '未配置向量化模型，当前仅关键词检索。点右上角「设置」配置嵌入模型可启用语义检索',
@@ -913,6 +931,15 @@ export const en: Record<KnowledgeKey, string> = {
   noResults: 'No results',
   embeddingFailed: 'Embedding failed',
   confirmBulkDelete: 'Delete the selected {count} documents and all their chunks? This cannot be undone.',
+  confirmCascadeDeleteTitle: 'Confirm cascading delete',
+  confirmCascadeDelete: 'This directory has children, so deleting it removes the whole subtree. The following will be permanently deleted:',
+  confirmCascadeBulkDeleteTitle: 'Confirm cascading delete',
+  confirmCascadeBulkDelete: 'The selection contains non-empty directories, so deleting it removes their whole subtrees. The following will be permanently deleted:',
+  cascadeImpactDirectories: 'Directories',
+  cascadeImpactFiles: 'Files',
+  cascadeImpactChunks: 'Chunks',
+  cascadeImpactSnapshots: 'Raw snapshots',
+  cascadeDeleteConfirm: 'Delete subtree',
   noLocalModels: 'No local models yet',
   lexicalOnly: 'Lexical only',
   lexicalOnlyHint: 'No embedding model configured — search is lexical only. Use the Settings button (top right) to configure an embedding model and enable semantic retrieval.',

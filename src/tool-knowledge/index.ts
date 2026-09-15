@@ -581,10 +581,11 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(defineTool({
     name: 'knowledge_delete_document',
-    description: 'Delete one document (and its chunks) from a knowledge base.',
+    description: 'Delete one document (and its chunks) from a knowledge base. Deleting a non-empty directory requires recursive=true.',
     parameters: {
       baseId: { type: 'string', required: true, description: 'Knowledge base id (used for validation).' },
       documentId: { type: 'string', required: true, description: 'Document id to delete.' },
+      recursive: { type: 'boolean', description: 'Required only when deleting a non-empty directory and all of its descendants.' },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { deleted: { type: 'boolean', required: true } } },
@@ -595,7 +596,7 @@ export function apply(ctx: Context): void {
       if (doc.baseId !== args.baseId) {
         throw new Error(`document "${doc.title}" does not belong to knowledge base ${args.baseId}`)
       }
-      await knowledge.deleteDocument(args.documentId)
+      await knowledge.deleteDocument(args.documentId, { recursive: args.recursive === true })
       return { deleted: true }
     },
   }))

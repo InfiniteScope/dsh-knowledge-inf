@@ -42,14 +42,15 @@ dsh-knowledge brings document ingestion, parsing, chunking, retrieval, evidence 
 - pnpm: `>=10`
 - An installed and initialized DeepSeek Harness profile
 
-Before installing the plugin, add the following build permissions to the target profile's `pnpm-workspace.yaml`. These dependencies contain postinstall scripts; when pnpm 10 blocks them, `dsh plugin add` exits before it can register the bundle.
+Before installing the plugin, **merge** the following build permissions into the target profile's existing `allowBuilds` mapping in `pnpm-workspace.yaml`. Do not add a second `allowBuilds:` key: duplicate YAML keys make the file invalid. These dependencies require installation-time builds; when pnpm 10 blocks them, `dsh plugin add` exits before it can register the bundle.
 
 ```yaml
 allowBuilds:
+  esbuild: true
   onnxruntime-node: true
-  sharp: true
   protobufjs: true
-  tesseract.js: true
+  sharp: true
+  tesseract.js: false
 ```
 
 ### 2. Install the plugin
@@ -75,13 +76,42 @@ Lexical retrieval works without downloading a model. Scanned-document OCR, local
 
 ```bash
 # Tarball from GitHub Releases or npm pack
-dsh plugin --profile <name> add ./dsh-knowledge-0.3.9.tgz
+dsh plugin --profile <name> add ./dsh-knowledge-4.0.0.tgz
 
 # Local source directory; build it first
 dsh plugin --profile <name> add file:/path/to/dsh-knowledge
 ```
 
 If the first installation fails because pnpm blocked build scripts, add the `allowBuilds` entries and run the add command again. The package is normally already present in `node_modules`, and the second run completes bundle registration.
+
+</details>
+
+<details>
+<summary>Recover from <code>ERR_PNPM_WORKSPACE_MANIFEST_WRITER_PARSE</code></summary>
+
+This means pnpm could not parse the DSH profile's own `pnpm-workspace.yaml`; it happens before this plugin is downloaded or built. Back up the file first, then repair the YAML line named in the error:
+
+- Windows: `%USERPROFILE%\.dsh\profiles\<profile>\pnpm-workspace.yaml`
+- macOS / Linux: `~/.dsh/profiles/<profile>/pnpm-workspace.yaml`
+
+Do not overwrite the file if you do not know what its existing settings do. If the profile has no other intentional pnpm settings, it can be restored to this minimal valid configuration:
+
+```yaml
+packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+
+allowBuilds:
+  esbuild: true
+  onnxruntime-node: true
+  protobufjs: true
+  sharp: true
+  tesseract.js: false
+```
+
+Then rerun the same `dsh plugin --profile <profile> add ...` command. If YAML repair reveals `ERR_PNPM_IGNORED_BUILDS`, that is a separate build-approval error: add only the exact package key printed by pnpm, rather than broadly allowing scripts.
 
 </details>
 
@@ -192,17 +222,18 @@ The plugin exposes 14 tools. Reads, writes, and proactive retrieval all obey the
 
 ---
 
-## v0.3.9 highlights
+## v4.0.0 highlights
 
-- Import a single file or full directory tree by absolute path while retaining durable top-level source tracking.
-- Repoint only the selected top-level source, with parser identity updated when the extension changes.
-- Prevent raw-cache collisions between separate directory roots and preserve the previous committed source when replacement reindexing fails.
-- Fall back to `http://127.0.0.1:11434` for an empty Ollama embedding URL without allowing model browsing or pulls to alter active settings.
-- Improve shared theme tokens, viewport-aware popovers, dismissal behavior, toast interaction, and Chinese/English localization.
+- A directory source is identified by its base plus its canonical real path, so re-importing the same directory synchronizes the original tree in place instead of building a second root.
+- The first import, a repeat import, a single-file reindex, and the base-wide background reindex now share one sync engine. Each item reports created / updated / unchanged / deleted / failed; unchanged is never a failure, and a partly failed sync returns `partial` while keeping the work that succeeded.
+- Files in a directory are identified by directory source plus relative path. A tree that old behaviour already duplicated is reported as `ambiguous_source` and is never guessed, merged, or auto-deleted.
+- A single-file reindex re-reads the file from disk instead of replaying the stored snapshot. `sourcePath` is exposed read-only to the administrative API and never appears in model-facing search results.
+- Deleting a non-empty directory requires an explicit `recursive` confirmation and offers a `delete-impact` preview listing the directories, files, chunks, and raw snapshots that would be removed.
+- Includes the local model lifecycle and retrieval-status fixes from #16–#18 and the profile installation recovery documentation from #22.
 
-The upgrade requires no database migration, automatic reindex, or model redownload and does not change the v0.3.8 evidence-window contracts. ThinkForge-core's authorship from community PRs #10–#13 remains preserved in Git history.
+The upgrade requires no database migration, automatic reindex, legacy directory cleanup, or model redownload and does not change existing fields or call signatures. The sync report, `sourcePath`, the delete-impact preview, and the `recursive` argument are additive. The one deliberate tightening is that a non-empty directory can no longer be deleted silently.
 
-[Read the v0.3.9 GitHub Release](https://github.com/Soren-ABT/dsh-knowledge/releases/tag/v0.3.9) · [Read the changelog](./CHANGELOG.md)
+[Read the v4.0.0 GitHub Release](https://github.com/Soren-ABT/dsh-knowledge/releases/tag/v4.0.0) · [Read the changelog](./CHANGELOG.md)
 
 ---
 

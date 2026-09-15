@@ -1,5 +1,37 @@
 # Changelog
 
+## 4.0.0 — 2026-09-15
+
+### One directory source, one sync path (issue #20)
+
+- **Idempotent re-import**: a directory source is now identified by its base plus its canonical real path. Importing the same directory again synchronizes the original tree in place instead of creating a second root. Manual directories with no live source keep their previous organizational meaning, and the base-wide background reindex no longer skips tracked roots.
+- **Truthful sync results**: every import and directory reindex returns per-item `created` / `updated` / `unchanged` / `deleted` / `failed` outcomes with relative paths, and an aggregate `synced` / `unchanged` / `partial` status. Unchanged files are never reported as failures, and a sync that succeeds for most files while some fail returns `partial` with the successful work retained.
+- **Path-based identity**: directory children are matched by their actual source path. A legacy child with no stored path is adopted only when its name and kind are unique; two candidates are reported as `ambiguous_source` rather than resolved by a first-match guess. A tree that the old behaviour already duplicated is never merged, moved, or auto-deleted — the user inspects and removes it.
+- **Live reindex identity**: files imported from a directory retain `sourcePath`, so a single-file reindex re-reads the file from disk instead of replaying the stored snapshot. `sourcePath` is exposed on administrative document summaries and details, and is never included in model-facing search results.
+- **Resolved path identity**: every stored local source path is now the resolved real path, whether the source arrived as a directory tree, a single file, or a repoint. macOS reaches its temp directory through the `/var` symlink and Windows paths may go through a junction or a short name, so comparing the spelling a user typed would let one file become two sources. The management panel therefore displays the resolved path.
+
+### Explicit destructive deletes
+
+- **Delete impact preview**: `GET /knowledge/documents/:id/delete-impact` reports the directories, files, chunks, and durable raw snapshots a delete would remove, and whether an explicit confirmation is required.
+- **Recursive confirmation**: deleting a non-empty directory now fails with `recursive_confirmation_required` unless the caller passes `recursive: true`. The management panel fetches the impact first and shows a second confirmation listing the exact scope; the `knowledge_delete_document` tool exposes the same `recursive` argument. A batch delete preflights every selected root before any write, so a missing confirmation can never leave a partially deleted batch.
+
+### Local model lifecycle and retrieval status (issues #16–#18)
+
+- Isolated local embedding and rerank workers recover from a crashed or interrupted runtime instead of failing permanently.
+- Rerank readiness is finalized after normal inference, and retrieval reports the status of each lane so a degraded lane is visible rather than silent.
+
+### PDF parsing can no longer leak a host-level rejection
+
+- `pdf-parse` v1 bundles pdf.js v1.10, whose failure path leaks an unhandled rejection: `getDocument` throws before the library's local `doc` is ever assigned, so its unawaited `doc.destroy()` never runs and the half-built worker leaves a promise rejecting with nobody attached. Node 22 escalates that stray rejection to a process-level unhandled rejection, so importing a scanned or corrupt PDF reported an unhandled error in the host process — and failed CI on Node 22.19 while every assertion still passed.
+- pdf-parse now runs in its own worker thread, the same containment the OCR worker already uses for Tesseract.js and the embed/rerank processes use for onnxruntime. The stray rejection is recorded in that thread with a bounded, prefixed message and never reaches the host; the caller still receives a clean parse failure and falls through to pdfjs-dist layout extraction, OCR, and anydoc exactly as before.
+- A per-request ceiling means a PDF the engine cannot finish reports a clear failure instead of pinning an import indefinitely, and an install missing the worker bundle logs one warning and parses in-process rather than hanging.
+
+### Compatibility and quality
+
+- The release is additive and migration-free: 0.3.9 data directories start without a database migration, re-embedding, forced reindex, legacy directory cleanup, or model download. Existing fields and call signatures keep working; the sync result, `sourcePath` accessor, delete-impact preview, and `recursive` argument are additions.
+- Installing and recovering a DSH profile is documented in both READMEs (issue #22).
+- Full typecheck, the complete Vitest suite, the deterministic build, package verification, production audit policy, and the retrieval benchmark are part of the release preflight; cross-platform CI and the real local embedding/rerank smoke run before the tag.
+
 ## 0.3.9 — 2026-09-02
 
 ### Local-path import and source tracking

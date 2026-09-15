@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { KnowledgeService } from '../src/knowledge/index.js'
@@ -805,7 +805,7 @@ describe('KnowledgeService', () => {
     const fileB = docs.find(doc => doc.title === 'b.txt')
     expect(fileB?.parentDirectoryId).toBe(subDir!.id)
 
-    await service.deleteDocument(rootDir!.id)
+    await service.deleteDocument(rootDir!.id, { recursive: true })
     expect(service.listDocuments(base.id)).toHaveLength(0)
 
     await rm(root, { recursive: true, force: true })
@@ -917,7 +917,7 @@ describe('KnowledgeService', () => {
 
     // Selecting the directory AND one of its descendants folds to the root:
     // the subtree is deleted once, everything below it goes with it.
-    const deleted = await service.deleteDocuments([root.id, leaf.id, top.id])
+    const deleted = await service.deleteDocuments([root.id, leaf.id, top.id], { recursive: true })
     expect(deleted.deleted).toBe(2) // root (with subtree) + top
     expect(service.listDocuments(base.id)).toHaveLength(0)
   })
@@ -1410,7 +1410,10 @@ describe('KnowledgeService', () => {
       const store = (service as unknown as { store: { getDocument(id: string): { id: string; title: string; sourceType: string; parentDirectoryId?: string; sourcePath?: string } | undefined } }).store
       const rootSummary = service.listDocuments(base.id).find(doc => doc.sourceType === 'directory' && doc.parentDirectoryId === undefined)
       const root = store.getDocument(rootSummary!.id)
-      expect(root?.sourcePath).toBe(resolve(src))
+      // A stored local source path is the resolved real path: on macOS the
+      // temp directory is reached through /var, which is a symlink to
+      // /private/var, and only the resolved form is a stable identity.
+      expect(root?.sourcePath).toBe(await realpath(src))
 
       // Disk changes: a.txt removed, c.txt added — the reindex must sync.
       await rm(join(src, 'a.txt'))
