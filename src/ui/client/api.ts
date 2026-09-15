@@ -73,6 +73,20 @@ export interface BaseSummary {
   updatedAt: number
 }
 
+/** Read-only preview of what one delete would remove. The panel fetches this
+ *  before a destructive call so a cascading directory delete is never silent. */
+export interface DeleteImpact {
+  documentId: string
+  baseId: string
+  directories: number
+  files: number
+  chunks: number
+  rawSnapshots: number
+  /** True only when the target is a non-empty directory that needs an explicit
+   *  recursive confirmation before the host will accept the delete. */
+  requiresRecursive: boolean
+}
+
 export interface DocumentSummary {
   id: string
   baseId: string
@@ -81,6 +95,8 @@ export interface DocumentSummary {
   fileName?: string
   url?: string
   parentDirectoryId?: string
+  /** Absolute tracked path for a local-path source (administrative view only). */
+  sourcePath?: string
   charCount: number
   tokenCount?: number
   chunkCount: number
@@ -598,12 +614,18 @@ export class KnowledgeApi {
     return this.call('POST', '/documents/reindex', { ids }, 30 * 60_000)
   }
 
-  deleteDocument(id: string): Promise<{ deleted: boolean }> {
-    return this.call('DELETE', `/documents/${encodeURIComponent(id)}`)
+  /** Preview the subtree and durable snapshots a delete would remove. */
+  getDeleteImpact(documentId: string): Promise<DeleteImpact> {
+    return this.call('GET', `/documents/${encodeURIComponent(documentId)}/delete-impact`)
   }
 
-  deleteDocuments(ids: string[]): Promise<{ deleted: number }> {
-    return this.call('DELETE', '/documents', { ids })
+  deleteDocument(id: string, recursive = false): Promise<{ deleted: boolean }> {
+    const query = recursive ? '?recursive=true' : ''
+    return this.call('DELETE', `/documents/${encodeURIComponent(id)}${query}`)
+  }
+
+  deleteDocuments(ids: string[], recursive = false): Promise<{ deleted: number }> {
+    return this.call('DELETE', '/documents', { ids, recursive })
   }
 
   listChunks(documentId: string, limit?: number): Promise<ChunkView[]> {

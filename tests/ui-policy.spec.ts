@@ -24,4 +24,25 @@ describe('knowledge UI policy', () => {
     expect(panel).toContain('<Toasts toasts={toasts} onDismiss={dismissToast} />')
     expect(panel).toMatch(/setToasts\(prev => prev\.filter\(toast => toast\.id !== id\)\)/)
   })
+
+  it('previews the real impact and confirms a cascading directory delete', async () => {
+    const panel = await source('KnowledgeSection.tsx')
+
+    // Deleting a directory removes its whole subtree on the host, so the panel
+    // must read the host-reported impact and require a second confirmation
+    // instead of issuing the destructive call straight from the row menu.
+    expect(panel).toContain('getDeleteImpact(')
+    expect(panel).toMatch(/impact\.requiresRecursive/)
+    expect(panel).toMatch(/kind: 'confirmCascadeDelete'/)
+    expect(panel).toMatch(/kind: 'confirmCascadeBulkDelete'/)
+    expect(panel).toMatch(/api\.deleteDocument\(doc\.id, recursive\)/)
+    expect(panel).toMatch(/api\.deleteDocuments\(ids, recursive\)/)
+  })
+
+  it('never sets the recursive delete flag implicitly', async () => {
+    const api = await source('api.ts')
+
+    expect(api).toContain('deleteDocument(id: string, recursive = false)')
+    expect(api).toContain('deleteDocuments(ids: string[], recursive = false)')
+  })
 })

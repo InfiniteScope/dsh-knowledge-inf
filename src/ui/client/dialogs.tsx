@@ -71,6 +71,9 @@ export function ConfirmDialog(props: {
   title: string
   message: string
   confirmLabel: string
+  /** Optional impact lines, rendered as a list under the message (used by the
+   *  cascading-delete confirmation to name the exact scope being removed). */
+  details?: readonly string[]
   busy?: boolean
   onConfirm: () => void
   onClose: () => void
@@ -78,6 +81,11 @@ export function ConfirmDialog(props: {
   return (
     <Modal title={props.title} onClose={props.onClose} width={400}>
       <p style={{ fontSize: 13, margin: '0 0 16px', lineHeight: 1.6 }}>{props.message}</p>
+      {props.details !== undefined && props.details.length > 0 && (
+        <ul style={{ margin: '0 0 16px', padding: '8px 12px 8px 28px', fontSize: 12, lineHeight: 1.8, background: C.surface2, borderRadius: 6 }}>
+          {props.details.map(detail => <li key={detail}>{detail}</li>)}
+        </ul>
+      )}
       <div style={{ ...style.actionsRow, justifyContent: 'flex-end' }}>
         <button style={style.button} onClick={props.onClose}>✕</button>
         <button className="kb-danger-primary" style={style.primaryDanger} onClick={props.onConfirm} disabled={props.busy === true}>{props.confirmLabel}</button>

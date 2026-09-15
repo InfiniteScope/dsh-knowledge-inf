@@ -17,6 +17,7 @@ import type {
   BaseStats,
   BaseSummary,
   ChunkView,
+  DeleteImpact,
   DocumentSummary,
   KnowledgeConfig,
   LocalModelStatus,
@@ -137,7 +138,9 @@ type DialogState =
   | { kind: 'restoreBase' }
   | { kind: 'confirmDeleteBase'; base: BaseSummary }
   | { kind: 'confirmDeleteDoc'; doc: DocumentSummary }
+  | { kind: 'confirmCascadeDelete'; doc: DocumentSummary; impact: DeleteImpact }
   | { kind: 'confirmBulkDelete'; count: number }
+  | { kind: 'confirmCascadeBulkDelete'; count: number; impacts: DeleteImpact[] }
   | { kind: 'renameDoc'; doc: DocumentSummary }
   | { kind: 'createGroup'; forBaseId?: string }
   | { kind: 'renameGroup'; group: string }
@@ -849,9 +852,18 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
     })
   }, [api, run, reloadDocuments, notify, t])
 
-  const removeDocument = useCallback(async (doc: DocumentSummary): Promise<void> => {
+  const removeDocument = useCallback(async (doc: DocumentSummary, recursive = false): Promise<void> => {
     await run(async () => {
-      await api.deleteDocument(doc.id)
+      // A non-empty directory takes its whole subtree with it, so the exact
+      // scope is fetched and confirmed before any destructive call is issued.
+      if (!recursive) {
+        const impact = await api.getDeleteImpact(doc.id)
+        if (impact.requiresRecursive) {
+          setDialog({ kind: 'confirmCascadeDelete', doc, impact })
+          return
+        }
+      }
+      await api.deleteDocument(doc.id, recursive)
       notify('success', `${t('delete')}: ${doc.title}`)
       if (selectedDocId === doc.id) { setChunks([]); setRawText(null); setRawTextTruncated(false); setSelectedDocId(null) }
       setDialog(null)
@@ -874,6 +886,34 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
     walk(rootId)
     return [rootId, ...ids]
   }, [documents])
+
+  // The host folds a delete selection to its outermost roots before writing, so
+  // the impact preview has to fold it the same way or a directory would be
+  // counted twice — once as itself and once as its parent's descendant.
+  const outermostSelectedIds = useCallback((ids: readonly string[]): string[] => {
+    const selected = new Set(ids)
+    const byId = new Map(documents.map(doc => [doc.id, doc]))
+    return ids.filter(id => {
+      let parentId = byId.get(id)?.parentDirectoryId
+      while (parentId !== undefined) {
+        if (selected.has(parentId)) return false
+        parentId = byId.get(parentId)?.parentDirectoryId
+      }
+      return true
+    })
+  }, [documents])
+
+  // Impact lines for the cascading-delete confirmation, summed over the roots
+  // the host reported so the dialog names the exact scope being destroyed.
+  const cascadeImpactDetails = useCallback((impacts: readonly DeleteImpact[]): string[] => {
+    const sum = (pick: (impact: DeleteImpact) => number): number => impacts.reduce((total, impact) => total + pick(impact), 0)
+    return [
+      `${t('cascadeImpactDirectories')}: ${sum(impact => impact.directories)}`,
+      `${t('cascadeImpactFiles')}: ${sum(impact => impact.files)}`,
+      `${t('cascadeImpactChunks')}: ${sum(impact => impact.chunks)}`,
+      `${t('cascadeImpactSnapshots')}: ${sum(impact => impact.rawSnapshots)}`,
+    ]
+  }, [t])
 
   const reindexDoc = useCallback(async (doc: DocumentSummary): Promise<void> => {
     // Optimistic: mark the folder and its WHOLE subtree (all nesting levels)
@@ -954,14 +994,27 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
     })
   }, [api, run, reloadDocuments, notify, checkedDocs, t, collectSubtreeIds])
 
-  const bulkDelete = useCallback(async (): Promise<void> => {
+  const bulkDelete = useCallback(async (recursive = false): Promise<void> => {
     await run(async () => {
-      const result = await api.deleteDocuments(checkedDocs.map(doc => doc.id))
+      const ids = checkedDocs.map(doc => doc.id)
+      if (!recursive) {
+        // Fold to the outermost roots first: the host deletes exactly that set,
+        // so the preview must report the same scope instead of double-counting
+        // a directory together with its own descendants.
+        const impacts = (await Promise.all(outermostSelectedIds(ids).map(async id => api.getDeleteImpact(id))))
+          .filter(impact => impact.requiresRecursive)
+        if (impacts.length > 0) {
+          setDialog({ kind: 'confirmCascadeBulkDelete', count: ids.length, impacts })
+          return
+        }
+      }
+      const result = await api.deleteDocuments(ids, recursive)
       notify('success', `${t('delete')}: ${result.deleted}`)
       setCheckedDocIds(new Set())
+      setDialog(null)
       await reloadDocuments()
     })
-  }, [api, run, reloadDocuments, notify, checkedDocs, t])
+  }, [api, run, reloadDocuments, notify, checkedDocs, t, outermostSelectedIds])
 
   const restoreBase = useCallback(async (name: string, config?: RestoreEmbeddingConfig): Promise<void> => {
     if (selectedBaseId === null) return
@@ -1821,6 +1874,28 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
           confirmLabel={t('delete')}
           busy={busy}
           onConfirm={() => void removeDocument(dialog.doc)}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === 'confirmCascadeDelete' && (
+        <ConfirmDialog
+          title={t('confirmCascadeDeleteTitle')}
+          message={t('confirmCascadeDelete')}
+          details={cascadeImpactDetails([dialog.impact])}
+          confirmLabel={t('cascadeDeleteConfirm')}
+          busy={busy}
+          onConfirm={() => void removeDocument(dialog.doc, true)}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === 'confirmCascadeBulkDelete' && (
+        <ConfirmDialog
+          title={t('confirmCascadeBulkDeleteTitle')}
+          message={t('confirmCascadeBulkDelete')}
+          details={cascadeImpactDetails(dialog.impacts)}
+          confirmLabel={`${t('cascadeDeleteConfirm')} (${dialog.count})`}
+          busy={busy}
+          onConfirm={() => void bulkDelete(true)}
           onClose={() => setDialog(null)}
         />
       )}
