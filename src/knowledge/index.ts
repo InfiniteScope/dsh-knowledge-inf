@@ -32,7 +32,7 @@ import {
 import type { LocalModelStatus } from './embed.js'
 import { cancelLocalModelDownload, deleteLocalModel, downloadLocalModel, hasActiveLocalRerankDownload, listLocalModels, LOCAL_MODELS, registerCustomLocalReranker, selfTestLocalModel } from './localModels.js'
 import type { LocalModelSummary } from './localModels.js'
-import { disposeLocalRerankProcess, setLocalRerankIdleTimeoutMs } from './local-rerank.js'
+import { disposeLocalRerankProcess, localRerankChildIsWarm, setLocalRerankIdleTimeoutMs } from './local-rerank.js'
 import { downloadOcrModels, disposeOcrWorker, getOcrModelStatus, removeOcrModels, type OcrModelStatus } from './ocr.js'
 import { httpFetch } from './net.js'
 import { knowledgeRoute } from './http.js'
@@ -198,6 +198,9 @@ const PROGRESS_LINGER_TTL_MS = 60_000
  *  linger: the reported embedding failure expired after 60s, so a user who
  *  looked a minute later saw the job simply vanish with no recorded error. */
 const FAILURE_LINGER_TTL_MS = 10 * 60_000
+/** Extra deadline granted to a COLD local rerank child so its model load is not
+ *  charged to the inference budget of the query that triggered it (issue #18). */
+const LOCAL_RERANK_LOAD_ALLOWANCE_MS = 120_000
 /** Embedding batch retry policy (Cherry's job retry contract). */
 const EMBED_MAX_ATTEMPTS = 3
 const EMBED_RETRY_BASE_DELAY_MS = 1000
@@ -3033,7 +3036,7 @@ export class KnowledgeService extends Service {
         }
       }
       throwIfAborted(signal)
-      return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, total, startedAt, allowRerank, signal, laneStatus)
+      return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, total, startedAt, laneStatus, allowRerank, signal)
     }
 
     const chunks = (request.baseId !== undefined
@@ -3095,7 +3098,7 @@ export class KnowledgeService extends Service {
         returnedCount: ranked.filter(hit => hit.vectorScore !== undefined).length,
       },
     )
-    return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, chunks.length, startedAt, allowRerank, signal, retrieval)
+    return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, chunks.length, startedAt, retrieval, allowRerank, signal)
   }
 
   /** Merge independent query rankings with RRF, then optionally rerank once. */
@@ -3156,9 +3159,14 @@ export class KnowledgeService extends Service {
     threshold: number,
     total: number,
     startedAt: number,
+    // Required, and placed before the optional tail so the compiler enforces it:
+    // the status must come from the lanes that actually ran. The old row-derived
+    // default is gone because that inference IS the #16 defect — a search whose
+    // vector lane contributed reported `mode: "lexical"` whenever no single row
+    // happened to carry both scores.
+    retrieval: RetrievalStatus,
     allowRerank = true,
     signal?: AbortSignal,
-    retrieval = retrievalStatusFromRanked(requestedMode, initial),
   ): Promise<SearchResult> {
     throwIfAborted(signal)
     const ranked = initial
@@ -3230,7 +3238,15 @@ export class KnowledgeService extends Service {
     )
     const candidateCount = contextual.length
     const rerankStartedAt = Date.now()
-    const rerankTimeoutMs = rerankModel.startsWith('local:') ? config.localRerankTimeoutMs : 60_000
+    // A cold local child loads ~280MB before it can score anything, and that load
+    // shares this single deadline with the inference it precedes. Without an
+    // allowance the first query after a restart (or after an idle release) could
+    // be killed mid-load, which used to latch the readiness gate and leave the
+    // reranker unusable until a manual self-test (issue #18). The allowance is
+    // granted only when the child has not scored anything yet.
+    const rerankTimeoutMs = rerankModel.startsWith('local:')
+      ? config.localRerankTimeoutMs + (localRerankChildIsWarm() ? 0 : LOCAL_RERANK_LOAD_ALLOWANCE_MS)
+      : 60_000
     try {
       const scores = await rerankCandidates(
         config.rerankBaseUrl,
@@ -3319,11 +3335,13 @@ export class KnowledgeService extends Service {
       configured: true,
       provider: this.rerankProvider(model),
       model,
-      status: 'degraded',
+      // A gate refusal is not a degradation: nothing was attempted, so say so
+      // and omit the elapsed time rather than reporting a failure at 0ms.
+      status: skipped ? 'skipped' : 'degraded',
       attempted: !skipped,
       applied: false,
       candidateCount,
-      elapsedMs,
+      ...(skipped ? {} : { elapsedMs }),
       error,
     }
   }
@@ -3775,30 +3793,6 @@ function embeddingKey(config: KnowledgeConfig): string | undefined {
     : config.embeddingModel.trim()
   if (model === '') return undefined
   return `${config.embeddingProvider}:${model}`
-}
-
-/**
- * Report actual retrieval contribution rather than inspecting whether one
- * arbitrary final row happened to carry both scores. RRF legitimately admits
- * one-lane rows, so the old per-row `&&` test misreported vector-only results
- * as lexical (Issue #16).
- */
-function retrievalStatusFromRanked(requestedMode: SearchMode, ranked: readonly RankedHit[]): RetrievalStatus {
-  const vectorCount = ranked.reduce((count, hit) => count + (hit.vectorScore !== undefined ? 1 : 0), 0)
-  const lexicalCount = ranked.reduce((count, hit) => count + (hit.lexicalScore !== undefined ? 1 : 0), 0)
-  const vectorRequested = requestedMode === 'vector' || requestedMode === 'hybrid' || requestedMode === 'auto'
-  const lexicalRequested = requestedMode !== 'vector'
-  const effectiveMode: SearchMode = vectorCount > 0 && lexicalCount > 0
-    ? 'hybrid'
-    : vectorCount > 0
-      ? 'vector'
-      : 'lexical'
-  return {
-    requestedMode,
-    effectiveMode,
-    lexical: { attempted: lexicalRequested, succeeded: lexicalCount > 0, returnedCount: lexicalCount },
-    vector: { attempted: vectorRequested, succeeded: vectorCount > 0, returnedCount: vectorCount },
-  }
 }
 
 function retrievalStatus(

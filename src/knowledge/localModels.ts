@@ -20,6 +20,7 @@ import {
   loadLocalReranker,
   releaseLocalReranker,
   selfTestLocalReranker,
+  setLocalRerankChildGoneListener,
   setLocalRerankProgressListener,
   type LocalRerankFailureCode,
 } from './local-rerank.js'
@@ -67,10 +68,18 @@ interface LiveRerankStatus {
   message: string
   lastCheckedAt?: number
   latencyMs?: number
+  /** When `status` was last published, so a flag whose owner is gone cannot
+   *  veto the readiness gate forever (see RERANK_STATUS_STALE_MS). */
+  statusChangedAt?: number
 }
 
 const REGISTRY_FILE = '.dsh-rerank-models.json'
 const READY_FILE = '.dsh-rerank-ready.json'
+/** How long a displayed `downloading`/`validating` may veto the readiness gate
+ *  without a refresh from its owner. Comfortably longer than a self-test or a
+ *  cache load, and far shorter than "forever", which is what a latched flag used
+ *  to mean. */
+const RERANK_STATUS_STALE_MS = 2 * 60_000
 const liveRerankStatus = new Map<string, LiveRerankStatus>()
 const cancelledRerankers = new Set<string>()
 const readinessCache = new Map<string, { cacheDir: string; record: ReadinessRecord }>()
@@ -94,7 +103,17 @@ setLocalRerankProgressListener(event => {
     health: event.status === 'ready' ? 'healthy' : event.status === 'validating' ? 'checking' : event.status === 'error' ? 'unhealthy' : 'unchecked',
     progress: event.progress,
     message: event.message,
+    statusChangedAt: Date.now(),
   })
+})
+
+// The child that published a status is the only thing that could clear it, so its
+// teardown drops the entry. Without this a `validating` published before a crash,
+// timeout or idle release stayed latched forever: GET /local-models showed
+// "validating / checking / 100" and every search was refused with model_checking
+// for a model a self-test answers in milliseconds (issue #18).
+setLocalRerankChildGoneListener(modelId => {
+  liveRerankStatus.delete(modelId)
 })
 
 export function validateHuggingFaceRepoId(id: string): string {
@@ -250,13 +269,13 @@ export function hasActiveLocalRerankDownload(): boolean {
 }
 
 async function validateReranker(descriptor: LocalModelDescriptor): Promise<LocalModelSummary> {
-  liveRerankStatus.set(descriptor.id, { status: 'validating', health: 'checking', progress: 100, message: '' })
+  liveRerankStatus.set(descriptor.id, { status: 'validating', health: 'checking', progress: 100, message: '', statusChangedAt: Date.now() })
   try {
     const report = await selfTestLocalReranker(descriptor.id, localModelCacheDir(), getHfEndpoint())
     const record = await writeReadiness(descriptor, report.latencyMs)
-    liveRerankStatus.set(descriptor.id, { status: 'ready', health: 'healthy', progress: 100, message: '', lastCheckedAt: record.validatedAt, latencyMs: record.latencyMs })
+    liveRerankStatus.set(descriptor.id, { status: 'ready', health: 'healthy', progress: 100, message: '', lastCheckedAt: record.validatedAt, latencyMs: record.latencyMs, statusChangedAt: Date.now() })
   } catch (error) {
-    liveRerankStatus.set(descriptor.id, { status: 'unhealthy', health: 'unhealthy', progress: 100, message: error instanceof Error ? error.message : String(error) })
+    liveRerankStatus.set(descriptor.id, { status: 'unhealthy', health: 'unhealthy', progress: 100, message: error instanceof Error ? error.message : String(error), statusChangedAt: Date.now() })
   }
   return summarize(descriptor)
 }
@@ -273,13 +292,24 @@ export async function downloadLocalModel(id: string): Promise<LocalModelSummary>
     void loadLocalModel(id, 'feature-extraction').catch((error: unknown) => markLocalModelError(descriptor.id, error instanceof Error ? error.message : String(error)))
     return summarize(descriptor)
   }
-  liveRerankStatus.set(id, { status: 'downloading', health: 'unchecked', progress: 0, message: '' })
+  // Report `downloading` only when a transfer will actually happen. Writing it
+  // unconditionally made a plain re-validate of a complete model look like an
+  // active download (and made a cancel look like it had something in flight to
+  // discard — which would have deleted the finished model).
+  const cached = await modelFingerprint(id)
+  liveRerankStatus.set(id, {
+    status: cached.complete ? 'validating' : 'downloading',
+    health: cached.complete ? 'checking' : 'unchecked',
+    progress: cached.complete ? 100 : 0,
+    message: '',
+    statusChangedAt: Date.now(),
+  })
   cancelledRerankers.delete(id)
   void loadLocalReranker(id, localModelCacheDir(), getHfEndpoint())
     .then(() => validateReranker(descriptor))
     .catch((error: unknown) => {
       if (cancelledRerankers.delete(id)) return
-      liveRerankStatus.set(id, { status: 'error', health: 'unhealthy', progress: 0, message: error instanceof Error ? error.message : String(error) })
+      liveRerankStatus.set(id, { status: 'error', health: 'unhealthy', progress: 0, message: error instanceof Error ? error.message : String(error), statusChangedAt: Date.now() })
     })
   return summarize(descriptor)
 }
@@ -338,7 +368,15 @@ export async function assertLocalRerankerReady(modelId: string): Promise<void> {
   }
   if (descriptor.kind !== 'reranking') throw new LocalRerankError('unsupported_model', '所选本地模型不是重排模型', false)
   const live = liveRerankStatus.get(modelId)
-  if (live?.status === 'downloading' || live?.status === 'validating') throw new LocalRerankError('model_checking', '本地重排模型正在下载或验证，请稍后重试', true)
+  // A `downloading`/`validating` flag is only trusted while it is fresh. Its
+  // owner is the rerank child, and a child that died without publishing a final
+  // status used to veto this gate forever — refusing the very search that would
+  // have produced the `ready` that clears it. Stale flags now fall through to the
+  // real checks below (weights fingerprint + persisted readiness marker).
+  const liveIsFresh = live?.statusChangedAt === undefined || Date.now() - live.statusChangedAt < RERANK_STATUS_STALE_MS
+  if (liveIsFresh && (live?.status === 'downloading' || live?.status === 'validating')) {
+    throw new LocalRerankError('model_checking', '本地重排模型正在下载或验证，请稍后重试', true)
+  }
   if (live?.status === 'unhealthy' || live?.status === 'error') throw new LocalRerankError('model_unhealthy', '本地重排模型验证失败，请在设置中重新验证', false)
   const files = await modelFingerprint(modelId)
   if (!files.complete) throw new LocalRerankError('model_not_downloaded', '本地重排模型尚未下载，请在设置 → 本地模型中下载', false)

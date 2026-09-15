@@ -256,7 +256,7 @@ export interface RerankStatus {
   configured: true
   provider: 'local' | 'remote'
   model: string
-  status: 'applied' | 'not_needed' | 'degraded'
+  status: 'applied' | 'not_needed' | 'skipped' | 'degraded'
   attempted: boolean
   applied: boolean
   candidateCount: number

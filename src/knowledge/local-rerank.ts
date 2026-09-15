@@ -73,6 +73,25 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null
 let intentionalExit = false
 let childGeneration = 0
 let progressListener: ((event: LocalRerankProgressEvent) => void) | undefined
+/** Notified when the child that was serving a model is gone. Callers use it to
+ *  drop per-child state that nothing else can clear — most importantly a latched
+ *  `validating`, which otherwise makes the readiness gate refuse every later
+ *  search while the model itself is fine (issue #18's self-lock). */
+let childGoneListener: ((modelId: string) => void) | undefined
+/** True once the current child has scored a request, i.e. its model is loaded.
+ *  A cold child must read ~280MB before it can score anything, and that load
+ *  shares one deadline with the inference it precedes (issue #18). */
+let childWarm = false
+
+/** Whether a rerank request will pay a model load before it can score. */
+export function localRerankChildIsWarm(): boolean {
+  return child !== null && childWarm
+}
+
+function notifyChildGone(modelId: string | undefined): void {
+  if (modelId === undefined) return
+  childGoneListener?.(modelId)
+}
 
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error
@@ -166,7 +185,11 @@ function onMessage(message: unknown, generation: number): void {
     return
   }
   try {
-    finishActive(undefined, validateSuccess(entry, message))
+    const value = validateSuccess(entry, message)
+    // A scored response proves the model is loaded in this child, i.e. the next
+    // request will not pay the load again.
+    if (entry.request.operation === 'rerank') childWarm = true
+    finishActive(undefined, value)
   } catch (error) {
     finishActive(error instanceof Error ? error : new Error(String(error)))
     terminateChild()
@@ -176,6 +199,7 @@ function onMessage(message: unknown, generation: number): void {
 function spawnChild(): ChildProcess {
   if (child !== null) return child
   intentionalExit = false
+  childWarm = false
   const generation = ++childGeneration
   const spawned = fork(processPath(), [], {
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -195,12 +219,16 @@ function spawnChild(): ChildProcess {
   spawned.on('error', error => {
     if (child !== spawned || intentionalExit) return
     child = null
+    childWarm = false
+    notifyChildGone(active?.request.modelId)
     finishActive(new LocalRerankError('process_crash', `local rerank process failed: ${error.message}`, true))
   })
   spawned.on('exit', (code, signal) => {
     if (child !== spawned) return
     child = null
+    childWarm = false
     clearIdleTimer()
+    notifyChildGone(active?.request.modelId)
     if (!intentionalExit && active !== null) {
       finishActive(new LocalRerankError('process_crash', `local rerank process exited (${signal ?? code ?? 'unknown'})`, true))
     }
@@ -213,12 +241,18 @@ function spawnChild(): ChildProcess {
 function terminateChild(): void {
   clearIdleTimer()
   const running = child
+  const served = active?.request.modelId
   child = null
+  childWarm = false
   childGeneration += 1
-  if (running === null) return
+  if (running === null) {
+    notifyChildGone(served)
+    return
+  }
   intentionalExit = true
   running.removeAllListeners('message')
   running.kill('SIGKILL')
+  notifyChildGone(served)
 }
 
 function pump(): void {
@@ -357,6 +391,12 @@ export function setLocalRerankIdleTimeoutMs(ms: number): void {
 
 export function setLocalRerankProgressListener(listener: ((event: LocalRerankProgressEvent) => void) | undefined): void {
   progressListener = listener
+}
+
+/** Observe child teardown (idle release, timeout, crash, abort, dispose) so the
+ *  caller can drop the state that only that child could have cleared. */
+export function setLocalRerankChildGoneListener(listener: ((modelId: string) => void) | undefined): void {
+  childGoneListener = listener
 }
 
 export async function rerankInLocalProcess(

@@ -623,10 +623,14 @@ export interface RerankStatus {
   readonly configured: true
   readonly provider: 'local' | 'remote'
   readonly model: string
-  readonly status: 'applied' | 'not_needed' | 'degraded'
+  /** `skipped` means the reranker was never invoked — a readiness/queue gate
+   *  refused it before any work started. Reporting that as `degraded` told the
+   *  caller a rerank had failed when nothing had been attempted (issue #18). */
+  readonly status: 'applied' | 'not_needed' | 'skipped' | 'degraded'
   readonly attempted: boolean
   readonly applied: boolean
   readonly candidateCount: number
+  /** Only present when the reranker actually ran. */
   readonly elapsedMs?: number
   readonly error?: RerankErrorDetail
 }

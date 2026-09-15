@@ -135,9 +135,15 @@ export function renderKnowledgeSearchResult(
   value: SearchResult,
   baseNameOf: (baseId: string) => string | undefined = () => undefined,
 ): string {
-  const warning = value.rerank?.status === 'degraded'
-    ? `Rerank degraded (${value.rerank.error?.code ?? 'unknown'}): ${value.rerank.error?.message ?? 'using retrieval order'}\n`
-    : ''
+  // `skipped` is not a failure — the reranker was never invoked (a readiness,
+  // queue or circuit gate refused it). Say so distinctly so the model can act on
+  // it instead of reading it as a degraded rerank.
+  const rerank = value.rerank
+  const warning = rerank?.status === 'degraded'
+    ? `Rerank degraded (${rerank.error?.code ?? 'unknown'}): ${rerank.error?.message ?? 'using retrieval order'}\n`
+    : rerank?.status === 'skipped'
+      ? `Rerank skipped (${rerank.error?.code ?? 'unknown'}): ${rerank.error?.message ?? 'ranking without a reranker'}\n`
+      : ''
   if (value.hits.length === 0) return `${warning}no matches for "${value.query}"`
 
   const scoreKind = value.scoreKind === undefined ? '' : `, ${value.scoreKind}`
@@ -296,7 +302,7 @@ export function apply(ctx: Context): void {
               configured: { type: 'boolean', required: true },
               provider: { type: 'string', enum: ['local', 'remote'], required: true },
               model: { type: 'string', required: true },
-              status: { type: 'string', enum: ['applied', 'not_needed', 'degraded'], required: true },
+              status: { type: 'string', enum: ['applied', 'not_needed', 'skipped', 'degraded'], required: true },
               attempted: { type: 'boolean', required: true },
               applied: { type: 'boolean', required: true },
               candidateCount: { type: 'number', required: true },

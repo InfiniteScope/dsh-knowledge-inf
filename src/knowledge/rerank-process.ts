@@ -155,7 +155,12 @@ async function createRunner(request: LocalRerankRequest): Promise<Runner> {
     }
   }
 
-  progress(request.modelId, 'validating', 100)
+  // Deliberately NOT publishing 'validating' here. A routine load is not a
+  // verification, and publishing it as one re-armed the readiness gate's
+  // "checking" veto for every concurrent search whenever a child started (first
+  // use, after an idle kill, after a dispose, or on a model switch) — issue #18.
+  // The load reports `ready` below, and only a real self-test announces
+  // validation.
   tf.env.allowRemoteModels = false
   const localPath = join(request.cacheDir, request.modelId)
   let model: Awaited<ReturnType<TransformersModule['AutoModel']['from_pretrained']>>

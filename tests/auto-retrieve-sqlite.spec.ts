@@ -159,6 +159,45 @@ afterEach(() => {
 })
 
 describe('auto retrieval through the real SQLite lane', () => {
+  it('labels the mode from the lanes that ran, not from per-row scores (issue #16)', async () => {
+    const mounted = await mountService()
+    // Every input embeds to the same vector, so the vector lane always scores
+    // while the lexical lane has nothing to match.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ data: [{ embedding: [1, 0, 0] }] }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )))
+    try {
+      await mounted.service.setConfig({
+        embeddingProvider: 'openai',
+        embeddingBaseUrl: 'http://embed.invalid',
+        embeddingModel: 'lane-model',
+        embeddingApiKey: 'k',
+        searchMode: 'auto',
+      })
+      const base = await mounted.service.createBase({ name: 'lane-mode' })
+      await mounted.service.addTextDocument({ baseId: base.id, title: 'd', content: 'alpha beta gamma' })
+
+      // A query with no lexical overlap: one token whose trigrams appear nowhere
+      // in the document, and no short term that would trigger the LIKE fallback.
+      // The lane path therefore returns rows carrying ONLY a `vectorScore` — the
+      // exact shape the old per-row inference (`some(hit => vectorScore &&
+      // lexicalScore)`) read as "the vector path was skipped" and reported as
+      // `mode: "lexical"`.
+      const result = await mounted.service.search({ query: 'zzzzqqqq', baseId: base.id, mode: 'auto' })
+      expect(result.retrieval?.vector.succeeded).toBe(true)
+      expect(result.retrieval?.vector.returnedCount).toBeGreaterThan(0)
+      expect(result.retrieval?.lexical.returnedCount).toBe(0)
+      // Both lanes were consulted, so the strategy is hybrid — and it must never
+      // be reported as lexical while the vector lane contributed.
+      expect(result.mode).toBe('hybrid')
+      expect(result.mode).not.toBe('lexical')
+    } finally {
+      vi.unstubAllGlobals()
+      await mounted.close()
+    }
+  })
+
   it.each([
     ['年假', '年假申请需要提前三天在员工系统提交。', '年假'],
     ['体检', '年度体检可在健康中心页面预约时段。', '体检'],
