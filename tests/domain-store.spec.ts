@@ -1093,4 +1093,119 @@ describe('local-path import source tracking', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it('reuses one canonical directory source, reports a truthful diff, and refreshes live leaf paths', async () => {
+    const dir = await tempDir()
+    try {
+      vi.stubEnv('DSH_HOME', dir)
+      const source = join(dir, 'tracked')
+      const nested = join(source, 'nested')
+      const alpha = join(source, 'alpha.txt')
+      const beta = join(nested, 'beta.txt')
+      await mkdir(nested, { recursive: true })
+      await writeFile(alpha, 'alpha original', 'utf8')
+      await writeFile(beta, 'beta original', 'utf8')
+
+      const service = await mount(dir)
+      try {
+        const base = await service.createBase({ name: 'tracked source' })
+        const first = await service.importFromPath(base.id, source)
+        expect(first.kind).toBe('directory')
+        expect(first.mode).toBe('created')
+        expect(first.sync?.status).toBe('synced')
+        const store = storeOf(service)
+        const root = store.listDocuments(base.id).find(doc => doc.sourceType === 'directory' && doc.parentDirectoryId === undefined)!
+        const alphaDoc = store.listDocuments(base.id).find(doc => doc.sourcePath === alpha)!
+        expect(root).toBeDefined()
+        expect(alphaDoc).toBeDefined()
+
+        const repeated = await service.importFromPath(base.id, source)
+        expect(repeated.mode).toBe('synced')
+        expect(repeated.sourceId).toBe(root.id)
+        expect(repeated.sync?.status).toBe('unchanged')
+        expect(store.listDocuments(base.id).filter(doc => doc.sourceType === 'directory' && doc.parentDirectoryId === undefined)).toHaveLength(1)
+        expect(store.getDocument(alphaDoc.id)?.id).toBe(alphaDoc.id)
+
+        await writeFile(alpha, 'alpha changed from disk', 'utf8')
+        await writeFile(join(source, 'gamma.txt'), 'gamma new file', 'utf8')
+        await rm(beta)
+        const synced = await service.importFromPath(base.id, source)
+        expect(synced.sync?.status).toBe('synced')
+        expect(synced.sync?.created).toBeGreaterThanOrEqual(1)
+        expect(synced.sync?.updated).toBeGreaterThanOrEqual(1)
+        expect(synced.sync?.deleted).toBeGreaterThanOrEqual(1)
+        expect(store.getDocument(alphaDoc.id)?.rawText).toContain('alpha changed from disk')
+        expect(store.getDocument(alphaDoc.id)?.sourcePath).toBe(alpha)
+        expect(store.listDocuments(base.id).find(doc => doc.sourcePath === beta)).toBeUndefined()
+
+        // A direct file reindex now reads its live path too, not merely the
+        // stored snapshot left by the original directory import.
+        await writeFile(alpha, 'alpha direct reindex', 'utf8')
+        await service.reindexDocument(alphaDoc.id)
+        expect(store.getDocument(alphaDoc.id)?.rawText).toContain('alpha direct reindex')
+
+        // Base-wide background reindex processes the tracked root once rather
+        // than skipping every directory container.
+        await writeFile(alpha, 'alpha background reindex', 'utf8')
+        const started = await service.startReindexBase(base.id)
+        let status = service.reindexJobStatus(started.jobId)
+        for (let index = 0; index < 100 && (status === undefined || !status.done); index += 1) {
+          await new Promise(resolve => setTimeout(resolve, 10))
+          status = service.reindexJobStatus(started.jobId)
+        }
+        expect(status?.done).toBe(true)
+        expect(status?.errors).toEqual([])
+        expect(store.getDocument(alphaDoc.id)?.rawText).toContain('alpha background reindex')
+      } finally {
+        await closeStore(service)
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects ambiguous historical directory roots and requires an explicit recursive delete', async () => {
+    const dir = await tempDir()
+    try {
+      vi.stubEnv('DSH_HOME', dir)
+      const source = join(dir, 'guarded')
+      await mkdir(source, { recursive: true })
+      await writeFile(join(source, 'note.txt'), 'guarded source text', 'utf8')
+
+      const service = await mount(dir)
+      try {
+        const base = await service.createBase({ name: 'guarded source' })
+        await service.importFromPath(base.id, source)
+        const store = storeOf(service)
+        const root = store.listDocuments(base.id).find(doc => doc.sourceType === 'directory' && doc.parentDirectoryId === undefined)!
+        const impact = service.getDeleteImpact(root.id)
+        expect(impact.requiresRecursive).toBe(true)
+        expect(impact.directories).toBeGreaterThanOrEqual(1)
+        expect(impact.files).toBe(1)
+        expect(impact.rawSnapshots).toBe(1)
+
+        await expect(service.deleteDocument(root.id)).rejects.toMatchObject({ code: 'recursive_confirmation_required' })
+        expect(store.getDocument(root.id)).toBeDefined()
+        expect(store.listDocuments(base.id).filter(doc => doc.sourceType === 'file')).toHaveLength(1)
+
+        // Simulate an old dirty base that already contains two roots attached
+        // to the same canonical source. A re-import must refuse to choose one.
+        const duplicate = { ...root, id: crypto.randomUUID(), title: 'legacy duplicate source', createdAt: Date.now(), updatedAt: Date.now() }
+        await store.putDocument(duplicate)
+        await expect(service.importFromPath(base.id, source)).rejects.toMatchObject({ code: 'ambiguous_source' })
+        expect(store.getDocument(root.id)).toBeDefined()
+        expect(store.getDocument(duplicate.id)).toBeDefined()
+
+        await service.deleteDocuments([root.id], { recursive: true })
+        expect(store.getDocument(root.id)).toBeUndefined()
+        // The deliberately ambiguous historical root remains for explicit
+        // user review; the sync engine never auto-cleans it.
+        expect(store.getDocument(duplicate.id)).toBeDefined()
+      } finally {
+        await closeStore(service)
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

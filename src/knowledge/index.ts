@@ -8,8 +8,8 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import { createHash } from 'node:crypto'
-import { cp, mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
-import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { cp, mkdir, readdir, readFile, realpath, rename, rm, stat } from 'node:fs/promises'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { chunkText, mergeSemanticSegments, refineChunksByTokenLimit, splitSemanticSegments } from './chunk.js'
 import type { ChunkPiece } from './chunk.js'
 import { composeContextWindow, estimateContextTokens, serializeContextWindow } from './context.js'
@@ -63,9 +63,13 @@ import type {
   BaseSummary,
   CreateBaseRequest,
   ContextWindow,
+  DeleteImpact,
   DocumentDetail,
   DocumentSourceType,
   DocumentSummary,
+  DirectoryImportResult,
+  DirectorySyncItem,
+  DirectorySyncResult,
   EmbeddingProvider,
   ImportDirectoryRequest,
   ImportUrlRequest,
@@ -81,6 +85,9 @@ import type {
   RetrievalStatus,
   RerankErrorDetail,
   RerankStatus,
+  PathImportResult,
+  ReindexDocumentResult,
+  ReindexDocumentsResult,
   UpdateBaseRequest,
 } from './types.js'
 
@@ -216,6 +223,18 @@ interface IndexingFailure {
  *  layer maps it to 409 Conflict so callers can re-submit with a strategy. */
 export class ConflictError extends Error {
   readonly code = 'conflict'
+}
+
+/** A deterministic source-identity failure. Unlike a parse or provider
+ * failure, retrying without resolving the identified tree would be unsafe. */
+export class DirectorySourceError extends Error {
+  constructor(
+    readonly code: 'ambiguous_source' | 'source_path_conflict' | 'recursive_confirmation_required',
+    message: string,
+    readonly details?: Record<string, unknown>,
+  ) {
+    super(message)
+  }
 }
 
 export class KnowledgeService extends Service {
@@ -1118,77 +1137,106 @@ export class KnowledgeService extends Service {
     baseId: string,
     path: string,
     parentDirectoryId?: string,
-  ): Promise<{ imported: number; directories: number; errors: Array<{ file: string; error: string }> }> {
+  ): Promise<DirectoryImportResult> {
+    const prepared = await this.prepareDirectoryImport(baseId, path, parentDirectoryId)
+    const sync = await this.syncDirectorySource(prepared.root, prepared.sourcePath, prepared.mode)
+    const errors = sync.items
+      .filter(item => item.action === 'failed' && item.error !== undefined)
+      .map(item => ({ file: item.relativePath, error: item.error!.message }))
+    return {
+      // Keep the pre-4.0 fields stable: `imported` has always meant files,
+      // while `directories` includes the root on an initial import.
+      imported: sync.items.filter(item => item.kind === 'file' && item.action === 'created').length,
+      directories: sync.items.filter(item => item.kind === 'directory' && item.action === 'created').length,
+      errors,
+      sourceId: prepared.root.id,
+      mode: prepared.mode,
+      sync,
+    }
+  }
+
+  /** Resolve a directory to its real filesystem identity. The stored display
+   * path remains usable for reads, while comparisons use {@link sourcePathKey}
+   * so Windows casing and separators cannot create a second source root. */
+  private async canonicalDirectoryPath(path: string): Promise<string> {
+    const trimmed = path.trim()
+    if (trimmed.length === 0) throw new Error('path is required')
+    if (!isAbsolute(trimmed)) throw new Error(`path must be absolute: ${trimmed}`)
+    let canonical: string
+    try {
+      canonical = await realpath(resolve(trimmed))
+    } catch {
+      throw new Error(`path not found: ${trimmed}`)
+    }
+    let sourceStat
+    try {
+      sourceStat = await stat(canonical)
+    } catch {
+      throw new Error(`path not found: ${trimmed}`)
+    }
+    if (!sourceStat.isDirectory()) throw new Error(`not a directory: ${trimmed}`)
+    return canonical
+  }
+
+  /** Stable comparison key for paths that are already validated as local
+   * sources. `resolve` normalizes separators; Windows uses case-insensitive
+   * identity even when the physical volume preserves the original case. */
+  private sourcePathKey(path: string): string {
+    const normalized = resolve(path).replace(/\\/g, '/')
+    return process.platform === 'win32' ? normalized.toLocaleLowerCase('en-US') : normalized
+  }
+
+  private sameSourcePath(left: string, right: string): boolean {
+    return this.sourcePathKey(left) === this.sourcePathKey(right)
+  }
+
+  private relativeSourcePath(root: string, target: string): string {
+    const value = relative(root, target).replace(/\\/g, '/')
+    return value === '' ? '.' : value
+  }
+
+  /** Create or reuse exactly one source-root container. A duplicate path never
+   * silently creates a second tree, and a legacy ambiguous tree is never
+   * guessed or merged. */
+  private async prepareDirectoryImport(
+    baseId: string,
+    path: string,
+    parentDirectoryId?: string,
+  ): Promise<{ root: KnowledgeDocument; sourcePath: string; mode: 'created' | 'synced' }> {
     const store = this.requireStore()
-    const rootName = basename(path)
-    const rootId = parentDirectoryId ?? (await this.createDirectory(baseId, rootName)).id
-    let imported = 0
-    let directories = 1
-    const errors: Array<{ file: string; error: string }> = []
-    // Cherry's pathStorage: the container remembers its source path so a
-    // later reindex can rescan the disk and pick up new/removed files.
-    const recordSourcePath = async (containerId: string, source: string): Promise<void> => {
-      const current = store.getDocument(containerId)
-      if (current !== undefined) await store.putDocument({ ...current, sourcePath: source, updatedAt: Date.now() })
-    }
-    await recordSourcePath(rootId, path)
-
-    const walk = async (dir: string, parentId: string, depth: number): Promise<void> => {
-      if (depth > DIRECTORY_MAX_DEPTH) return
-      let entries
-      try {
-        entries = await readdir(dir, { withFileTypes: true })
-      } catch (error) {
-        errors.push({ file: dir, error: error instanceof Error ? error.message : String(error) })
-        return
-      }
-      for (const entry of entries) {
-        const full = join(dir, entry.name)
-        if (entry.isDirectory()) {
-          const child = await this.createDirectory(baseId, entry.name, parentId)
-          await recordSourcePath(child.id, full)
-          directories += 1
-          await walk(full, child.id, depth + 1)
-        } else if (entry.isFile() && DIRECTORY_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
-          try {
-            const buffer = await readFile(full)
-            const text = await parseDocumentBuffer(buffer, basename(full))
-            if (text.trim().length === 0) continue
-            // Cherry's prepare-root: the base owns a stable copy of every
-            // imported file under raw/, so a later reindex rebuilds from the
-            // base even if the source disk changes. The stored path is a fresh
-            // uuid (not the tree-relative path) so two roots that share a
-            // relative path never collide in raw storage.
-            let rawFilePath: string | undefined
-            if (store.raw !== undefined) {
-              rawFilePath = await store.raw.write(baseId, crypto.randomUUID(), safeRawExtension(basename(full)), buffer)
-            }
-            try {
-              await this.ingestDocument({
-                baseId,
-                title: basename(full),
-                sourceType: 'file',
-                fileName: basename(full),
-                parentDirectoryId: parentId,
-                rawFilePath,
-                text,
-              })
-            } catch (error) {
-              // A rejected item (e.g. duplicate content) must not leave an
-              // orphaned raw copy behind.
-              if (rawFilePath !== undefined) await store.raw?.delete(rawFilePath)
-              throw error
-            }
-            imported += 1
-          } catch (error) {
-            errors.push({ file: full, error: error instanceof Error ? error.message : String(error) })
-          }
-        }
+    if (store.getBase(baseId) === undefined) throw new Error(`knowledge base not found: ${baseId}`)
+    const sourcePath = await this.canonicalDirectoryPath(path)
+    if (parentDirectoryId !== undefined) {
+      const parent = store.getDocument(parentDirectoryId)
+      if (parent === undefined || parent.baseId !== baseId || parent.sourceType !== 'directory') {
+        throw new Error('parentDirectoryId must identify a directory in the target knowledge base')
       }
     }
-
-    await walk(path, rootId, 0)
-    return { imported, directories, errors }
+    const candidates = store.listDocuments(baseId).filter(document =>
+      document.sourceType === 'directory'
+      && document.sourcePath !== undefined
+      && this.sameSourcePath(document.sourcePath, sourcePath),
+    )
+    if (candidates.length > 1) {
+      throw new DirectorySourceError(
+        'ambiguous_source',
+        'more than one directory tree is already bound to this source path; inspect and delete the redundant tree manually',
+        { sourcePath, candidateIds: candidates.map(candidate => candidate.id) },
+      )
+    }
+    const existing = candidates[0]
+    if (existing !== undefined) {
+      if (existing.parentDirectoryId !== parentDirectoryId) {
+        throw new DirectorySourceError(
+          'source_path_conflict',
+          'this directory source is already imported under a different parent and cannot be copied or moved automatically',
+          { sourcePath, sourceId: existing.id, parentDirectoryId: existing.parentDirectoryId },
+        )
+      }
+      return { root: existing, sourcePath, mode: 'synced' }
+    }
+    const root = await this.createDirectory(baseId, basename(sourcePath), parentDirectoryId)
+    return { root, sourcePath, mode: 'created' }
   }
 
   /** Import a single local file by its absolute path (server-side). */
@@ -1234,11 +1282,7 @@ export class KnowledgeService extends Service {
    * validating that it exists first. Directories reuse the tree import, which
    * records `sourcePath` on every container so reindex rescans the disk.
    */
-  async importFromPath(baseId: string, path: string): Promise<{
-    kind: 'directory' | 'file'
-    imported: number
-    errors: Array<{ file: string; error: string }>
-  }> {
+  async importFromPath(baseId: string, path: string): Promise<PathImportResult> {
     const store = this.requireStore()
     if (store.getBase(baseId) === undefined) throw new Error(`knowledge base not found: ${baseId}`)
     const trimmed = path.trim()
@@ -1252,7 +1296,15 @@ export class KnowledgeService extends Service {
     }
     if (st.isDirectory()) {
       const result = await this.importDirectoryTree(baseId, trimmed)
-      return { kind: 'directory', imported: result.imported, errors: result.errors }
+      return {
+        kind: 'directory',
+        imported: result.imported,
+        errors: result.errors,
+        directories: result.directories,
+        sourceId: result.sourceId,
+        mode: result.mode,
+        sync: result.sync,
+      }
     }
     if (st.isFile()) {
       await this.importFileFromPath(baseId, trimmed)
@@ -1371,10 +1423,57 @@ export class KnowledgeService extends Service {
     return { changed: true, title: refreshed.title, chunkCount: refreshed.chunkCount }
   }
 
-  async deleteDocument(id: string): Promise<void> {
+  /** Preview the exact tree and durable raw snapshots affected by a delete.
+   * This is read-only and is safe to call before showing a destructive UI. */
+  getDeleteImpact(id: string): DeleteImpact {
+    const store = this.requireStore()
+    const root = store.getDocument(id)
+    if (root === undefined) throw new Error(`document not found: ${id}`)
+    const childrenByParent = new Map<string, KnowledgeDocument[]>()
+    for (const document of store.listDocuments(root.baseId)) {
+      if (document.parentDirectoryId === undefined) continue
+      const children = childrenByParent.get(document.parentDirectoryId) ?? []
+      children.push(document)
+      childrenByParent.set(document.parentDirectoryId, children)
+    }
+    const nodes: KnowledgeDocument[] = []
+    const visit = (document: KnowledgeDocument): void => {
+      nodes.push(document)
+      for (const child of childrenByParent.get(document.id) ?? []) visit(child)
+    }
+    visit(root)
+    const descendants = nodes.length - 1
+    return {
+      documentId: root.id,
+      baseId: root.baseId,
+      directories: nodes.filter(document => document.sourceType === 'directory').length,
+      files: nodes.filter(document => document.sourceType !== 'directory').length,
+      chunks: nodes.reduce((sum, document) => sum + document.chunkCount, 0),
+      rawSnapshots: new Set(nodes.flatMap(document => document.rawFilePath === undefined ? [] : [document.rawFilePath])).size,
+      requiresRecursive: root.sourceType === 'directory' && descendants > 0,
+    }
+  }
+
+  private assertDeleteImpacts(ids: readonly string[], recursive: boolean): string[] {
+    const store = this.requireStore()
+    const roots = this.outermostSelectedIds(ids).filter(id => store.getDocument(id) !== undefined)
+    const impacts = roots.map(id => this.getDeleteImpact(id))
+    const recursiveImpacts = impacts.filter(impact => impact.requiresRecursive)
+    if (recursiveImpacts.length > 0 && !recursive) {
+      throw new DirectorySourceError(
+        'recursive_confirmation_required',
+        'deleting a non-empty directory requires explicit recursive confirmation',
+        { impacts: recursiveImpacts },
+      )
+    }
+    return roots
+  }
+
+  async deleteDocument(id: string, options?: { recursive?: boolean }): Promise<void> {
     const store = this.requireStore()
     const existing = store.getDocument(id)
     if (existing === undefined) throw new Error(`document not found: ${id}`)
+    this.assertDeleteImpacts([id], options?.recursive === true)
     await this.deleteDocumentRecursive(id)
     // One updatedAt write per delete, not per descendant.
     await this.touchBase(existing.baseId)
@@ -1435,7 +1534,7 @@ export class KnowledgeService extends Service {
     return next
   }
 
-  async reindexDocument(id: string): Promise<KnowledgeDocument> {
+  async reindexDocument(id: string): Promise<ReindexDocumentResult> {
     const store = this.requireStore()
     const document = store.getDocument(id)
     if (document === undefined) throw new Error(`document not found: ${id}`)
@@ -1607,179 +1706,318 @@ export class KnowledgeService extends Service {
     return { text }
   }
 
-  /**
-   * Cherry's prepare-root rescan: re-read the container's remembered source
-   * directory and sync the base's children with the disk —
-   * - files/directories removed from disk are deleted from the base,
-   * - new supported files are parsed and ingested (raw copy persisted),
-   * - new subdirectories become containers (with their own sourcePath),
-   * - existing items are re-indexed (re-chunk + hash-reuse re-embed); when
-   *   the on-disk bytes differ from the base's persisted raw copy, the copy
-   *   is refreshed first so EDITS to source files are picked up too.
-   * A missing/unreadable source keeps the existing subtree untouched (Cherry
-   * skips roots whose source cannot be rebuilt). Failures are isolated per
-   * entry and summarized at the end.
-   */
-  private async rescanDirectory(document: KnowledgeDocument): Promise<KnowledgeDocument> {
+  /** Reindexing a tracked directory is the same operation as re-importing its
+   * source: one source identity, one diff engine, and one truthful result. */
+  private async rescanDirectory(document: KnowledgeDocument): Promise<ReindexDocumentResult> {
+    const sync = await this.syncDirectorySource(document, document.sourcePath!, 'synced')
+    const current = this.requireStore().getDocument(document.id) ?? document
+    return { ...current, sync }
+  }
+
+  /** Synchronize a single source-root against disk. Root validation happens
+   * before any write; child failures are preserved as itemized `partial`
+   * outcomes instead of being rethrown after useful work succeeds. */
+  private async syncDirectorySource(
+    root: KnowledgeDocument,
+    sourcePath: string,
+    mode: 'created' | 'synced',
+  ): Promise<DirectorySyncResult> {
     const store = this.requireStore()
-    const source = document.sourcePath!
-    // Mark the container itself active so its row shows a live status while
-    // the rescan runs (Cherry's directory `preparing` state); children get
-    // their own per-item statuses underneath.
-    this.indexing.set(document.id, { baseId: document.baseId, title: document.title, phase: 'parsing', total: 0, progress: 0 })
+    if (root.sourceType !== 'directory') throw new Error('directory sync requires a directory source')
+    const canonicalSource = await this.canonicalDirectoryPath(sourcePath)
     try {
-      const result = await this.rescanDirectoryInner(document, source)
-      // Cherry updates the container's updatedAt on every status flip; a
-      // finished rescan must refresh the folder row's timestamp too (files
-      // inside already do — the container itself did not).
-      const current = store.getDocument(document.id)
-      if (current !== undefined) {
-        await store.putDocument({ ...current, updatedAt: Date.now() })
-      }
-      return result
+      await readdir(canonicalSource, { withFileTypes: true })
+    } catch (error) {
+      throw new Error(`source directory is unreadable: ${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    const allDocuments = store.listDocuments(root.baseId)
+    const childrenByParent = new Map<string, KnowledgeDocument[]>()
+    for (const document of allDocuments) {
+      if (document.parentDirectoryId === undefined) continue
+      const children = childrenByParent.get(document.parentDirectoryId) ?? []
+      children.push(document)
+      childrenByParent.set(document.parentDirectoryId, children)
+    }
+    const items: DirectorySyncItem[] = []
+    this.indexing.set(root.id, { baseId: root.baseId, title: root.title, phase: 'parsing', total: 0, progress: 0 })
+    try {
+      const boundRoot = await this.bindDocumentSourcePath(root, canonicalSource)
+      items.push({
+        relativePath: '.',
+        kind: 'directory',
+        documentId: boundRoot.id,
+        action: mode === 'created' ? 'created' : boundRoot === root ? 'unchanged' : 'updated',
+      })
+      await this.syncDirectoryNode({
+        rootPath: canonicalSource,
+        diskPath: canonicalSource,
+        directory: boundRoot,
+        depth: 0,
+        childrenByParent,
+        items,
+      })
+      const current = store.getDocument(root.id)
+      if (current !== undefined) await store.putDocument({ ...current, updatedAt: Date.now() })
+      await this.touchBase(root.baseId)
     } finally {
-      this.indexing.delete(document.id)
+      this.indexing.delete(root.id)
+    }
+    const count = (action: DirectorySyncItem['action']): number => items.filter(item => item.action === action).length
+    const failed = count('failed')
+    const changed = count('created') + count('updated') + count('deleted')
+    return {
+      sourceId: root.id,
+      status: failed > 0 ? 'partial' : changed === 0 ? 'unchanged' : 'synced',
+      created: count('created'),
+      updated: count('updated'),
+      unchanged: count('unchanged'),
+      deleted: count('deleted'),
+      failed,
+      items,
     }
   }
 
-  private async rescanDirectoryInner(document: KnowledgeDocument, source: string): Promise<KnowledgeDocument> {
-    const store = this.requireStore()
+  private async bindDocumentSourcePath(document: KnowledgeDocument, sourcePath: string): Promise<KnowledgeDocument> {
+    if (document.sourcePath === sourcePath) return document
+    const next = { ...document, sourcePath, updatedAt: Date.now() }
+    await this.requireStore().putDocument(next)
+    return next
+  }
+
+  private directoryItemError(error: unknown): { code: string; message: string } {
+    if (error instanceof DirectorySourceError) return { code: error.code, message: error.message }
+    return {
+      code: 'sync_failed',
+      message: error instanceof Error ? error.message : String(error),
+    }
+  }
+
+  /** Resolve a direct child by its physical source path. A legacy child can be
+   * adopted only when its name and kind are unique; two candidates are an
+   * explicit ambiguity, never a first-match guess. */
+  private resolveDirectoryChild(
+    children: readonly KnowledgeDocument[],
+    kind: 'file' | 'directory',
+    diskPath: string,
+    name: string,
+  ): { document?: KnowledgeDocument; ambiguous?: readonly KnowledgeDocument[] } {
+    const expectedType: DocumentSourceType = kind === 'directory' ? 'directory' : 'file'
+    const fullPath = join(diskPath, name)
+    const exact = children.filter(child =>
+      child.sourceType === expectedType
+      && child.sourcePath !== undefined
+      && this.sameSourcePath(child.sourcePath, fullPath),
+    )
+    if (exact.length > 1) return { ambiguous: exact }
+    if (exact.length === 1) return { document: exact[0] }
+    const legacy = children.filter(child =>
+      child.sourceType === expectedType
+      && child.sourcePath === undefined
+      && (kind === 'directory' ? child.title : (child.fileName ?? child.title)) === name,
+    )
+    if (legacy.length > 1) return { ambiguous: legacy }
+    return legacy.length === 1 ? { document: legacy[0] } : {}
+  }
+
+  private async syncDirectoryNode(args: {
+    rootPath: string
+    diskPath: string
+    directory: KnowledgeDocument
+    depth: number
+    childrenByParent: Map<string, KnowledgeDocument[]>
+    items: DirectorySyncItem[]
+  }): Promise<void> {
+    const { rootPath, diskPath, directory, depth, childrenByParent, items } = args
+    if (depth > DIRECTORY_MAX_DEPTH) {
+      items.push({
+        relativePath: this.relativeSourcePath(rootPath, diskPath),
+        kind: 'directory',
+        documentId: directory.id,
+        action: 'failed',
+        error: { code: 'max_depth', message: `directory depth exceeds the ${DIRECTORY_MAX_DEPTH} level limit` },
+      })
+      return
+    }
     let entries
     try {
-      entries = await readdir(source, { withFileTypes: true })
-    } catch {
-      // Source gone/unreadable: keep the existing subtree (never wipe vectors
-      // for content that cannot be rebuilt — Cherry's canRebuildSource guard).
-      this.ctx.logger.warn(`knowledge: source directory unreadable, keeping existing subtree: ${source}`)
-      return document
+      entries = await readdir(diskPath, { withFileTypes: true })
+    } catch (error) {
+      items.push({
+        relativePath: this.relativeSourcePath(rootPath, diskPath),
+        kind: 'directory',
+        documentId: directory.id,
+        action: 'failed',
+        error: this.directoryItemError(error),
+      })
+      return
     }
-    const children = store.listDocuments(document.baseId).filter(child => child.parentDirectoryId === document.id)
-    const onDisk = new Set(entries.map(entry => entry.name))
-    let failures = 0
-    let firstError = ''
-    const fail = (error: unknown): void => {
-      failures += 1
-      if (firstError === '') firstError = error instanceof Error ? error.message : String(error)
-    }
-    // 1. Items whose source disappeared from disk are removed.
-    for (const child of children) {
-      const name = child.sourceType === 'directory' ? child.title : (child.fileName ?? child.title)
-      if (!onDisk.has(name)) {
-        try {
-          await this.deleteDocumentRecursive(child.id)
-        } catch (error) {
-          fail(error)
-        }
+    entries.sort((left, right) => left.name.localeCompare(right.name))
+    const entriesByName = new Map(entries.map(entry => [entry.name, entry]))
+    let children = [...(childrenByParent.get(directory.id) ?? [])]
+
+    // Remove only direct, path-bound children whose source really disappeared
+    // or changed kind. User-created/legacy children with no source path are
+    // retained until a unique disk match lets the sync adopt them safely.
+    for (const child of [...children]) {
+      if (child.sourcePath === undefined || this.sourcePathKey(dirname(child.sourcePath)) !== this.sourcePathKey(diskPath)) continue
+      const entry = entriesByName.get(basename(child.sourcePath))
+      const actualKind = entry?.isDirectory() === true ? 'directory' : entry?.isFile() === true ? 'file' : undefined
+      const expectedKind = child.sourceType === 'directory' ? 'directory' : child.sourceType === 'file' ? 'file' : undefined
+      if (expectedKind === undefined || (actualKind === expectedKind) || actualKind === undefined && entry !== undefined) continue
+      try {
+        await this.deleteTrackedSyncSubtree(child, rootPath, items)
+        children = children.filter(candidate => candidate.id !== child.id)
+        childrenByParent.set(directory.id, children)
+      } catch (error) {
+        items.push({
+          relativePath: this.relativeSourcePath(rootPath, child.sourcePath),
+          kind: expectedKind,
+          documentId: child.id,
+          action: 'failed',
+          error: this.directoryItemError(error),
+        })
       }
     }
-    // 2. Sync with what is on disk now.
-    const remaining = store.listDocuments(document.baseId).filter(child => child.parentDirectoryId === document.id)
+
     for (const entry of entries) {
-      const full = join(source, entry.name)
+      const fullPath = join(diskPath, entry.name)
+      const relativePath = this.relativeSourcePath(rootPath, fullPath)
       if (entry.isDirectory()) {
-        const existing = remaining.find(child => child.sourceType === 'directory' && child.title === entry.name)
-        try {
-          if (existing !== undefined) {
-            const withSource = existing.sourcePath === full ? existing : { ...existing, sourcePath: full }
-            await this.rescanDirectory(withSource)
-          } else {
-            const created = await this.createDirectory(document.baseId, entry.name, document.id)
-            await this.rescanDirectory({ ...created, sourcePath: full })
-          }
-        } catch (error) {
-          fail(error)
+        const resolved = this.resolveDirectoryChild(children, 'directory', diskPath, entry.name)
+        if (resolved.ambiguous !== undefined) {
+          items.push({
+            relativePath,
+            kind: 'directory',
+            action: 'failed',
+            error: {
+              code: 'ambiguous_source',
+              message: `multiple stored directory items match ${relativePath}`,
+            },
+          })
+          continue
         }
-      } else if (entry.isFile() && DIRECTORY_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
-        const existing = remaining.find(child => child.fileName === entry.name)
         try {
-          if (existing !== undefined) {
-            if (this.indexing.has(existing.id)) continue
-            // Content sync with the disk: reindex alone rebuilds from the
-            // base's persisted raw copy, so edits to a source file were never
-            // picked up. When the on-disk bytes differ from the stored copy,
-            // refresh the copy and re-index from the NEW content. Equal bytes
-            // fall through to the plain reindex (rebuild from the stored
-            // copy); a failed disk read must never wipe the stored copy or
-            // the existing vectors, so it also falls through unchanged.
-            if (store.raw !== undefined && existing.rawFilePath !== undefined) {
-              try {
-                const buffer = await readFile(full)
-                const stored = await store.raw.read(existing.rawFilePath)
-                const changed = stored === null || stored === undefined || stored.byteLength === 0
-                  || !Buffer.from(stored).equals(buffer)
-                if (changed) {
-                  const text = await parseDocumentBuffer(buffer, entry.name)
-                  // Never replace a good snapshot with empty/unreadable new
-                  // content: keep the stored copy and the old vectors.
-                  if (text.trim().length > 0) {
-                    // rawFilePath already carries the `<baseId>/` prefix (it is
-                    // the full base-relative path), so strip it before writeRel,
-                    // which prepends `<baseId>/` again — otherwise the refreshed
-                    // bytes land at a doubled path and the following reindex still
-                    // rebuilds from the stale stored copy.
-                    const relRaw = existing.rawFilePath.startsWith(`${document.baseId}/`)
-                      ? existing.rawFilePath.slice(document.baseId.length + 1)
-                      : existing.rawFilePath
-                    await store.raw.writeRel(document.baseId, relRaw, buffer)
-                    await this.reindexDocument(existing.id)
-                    continue
-                  }
-                }
-              } catch {
-                // Disk or raw read failed: fall back to the stored-copy
-                // reindex below (the copy and vectors stay intact).
-              }
-            }
-            await this.reindexDocument(existing.id)
-          } else {
-            // New file: parse + ingest like an import, with a persisted raw
-            // copy so a later reindex can rebuild from the base even if the
-            // source disk changes. The stored path is a fresh uuid (not the
-            // tree-relative path) so it cannot collide with a sibling root's
-            // file that happens to share the same relative path.
-            const buffer = await readFile(full)
-            const text = await parseDocumentBuffer(buffer, entry.name)
-            if (text.trim().length === 0) continue
-            let rawFilePath: string | undefined
-            if (store.raw !== undefined) {
-              rawFilePath = await store.raw.write(document.baseId, crypto.randomUUID(), safeRawExtension(entry.name), buffer)
-              try {
-                await this.ingestDocument({
-                  baseId: document.baseId,
-                  title: entry.name,
-                  sourceType: 'file',
-                  fileName: entry.name,
-                  parentDirectoryId: document.id,
-                  rawFilePath,
-                  text,
-                })
-              } catch (error) {
-                // A rejected item (e.g. duplicate content) must not leave an
-                // orphaned raw copy behind.
-                await store.raw.delete(rawFilePath)
-                throw error
-              }
-            } else {
-              await this.ingestDocument({
-                baseId: document.baseId,
-                title: entry.name,
-                sourceType: 'file',
-                fileName: entry.name,
-                parentDirectoryId: document.id,
-                text,
-              })
-            }
+          let child = resolved.document
+          let action: DirectorySyncItem['action'] = 'unchanged'
+          if (child === undefined) {
+            child = await this.createDirectory(directory.baseId, entry.name, directory.id)
+            action = 'created'
+            children.push(child)
+            childrenByParent.set(directory.id, children)
           }
+          const bound = await this.bindDocumentSourcePath(child, fullPath)
+          if (bound !== child && action === 'unchanged') action = 'updated'
+          const childIndex = children.findIndex(candidate => candidate.id === child!.id)
+          if (childIndex >= 0) children[childIndex] = bound
+          items.push({ relativePath, kind: 'directory', documentId: bound.id, action })
+          await this.syncDirectoryNode({ rootPath, diskPath: fullPath, directory: bound, depth: depth + 1, childrenByParent, items })
         } catch (error) {
-          fail(error)
+          items.push({ relativePath, kind: 'directory', action: 'failed', error: this.directoryItemError(error) })
         }
+        continue
+      }
+      if (!entry.isFile() || !DIRECTORY_EXTENSIONS.has(extname(entry.name).toLowerCase())) continue
+      const resolved = this.resolveDirectoryChild(children, 'file', diskPath, entry.name)
+      if (resolved.ambiguous !== undefined) {
+        items.push({
+          relativePath,
+          kind: 'file',
+          action: 'failed',
+          error: { code: 'ambiguous_source', message: `multiple stored file items match ${relativePath}` },
+        })
+        continue
+      }
+      try {
+        let document = resolved.document
+        let action: DirectorySyncItem['action']
+        if (document === undefined) {
+          document = await this.ingestDirectoryFile(directory.baseId, directory.id, fullPath, entry.name)
+          action = 'created'
+          children.push(document)
+          childrenByParent.set(directory.id, children)
+        } else {
+          action = await this.syncDirectoryFile(document, fullPath, entry.name)
+          const refreshed = this.requireStore().getDocument(document.id)
+          if (refreshed !== undefined) {
+            const documentIndex = children.findIndex(candidate => candidate.id === document!.id)
+            if (documentIndex >= 0) children[documentIndex] = refreshed
+            document = refreshed
+          }
+        }
+        items.push({ relativePath, kind: 'file', documentId: document.id, action })
+      } catch (error) {
+        items.push({ relativePath, kind: 'file', documentId: resolved.document?.id, action: 'failed', error: this.directoryItemError(error) })
       }
     }
-    await this.touchBase(document.baseId)
-    if (failures > 0) {
-      throw new Error(`directory rescan finished with ${failures} failed item(s): ${firstError}`)
+  }
+
+  private async ingestDirectoryFile(baseId: string, parentDirectoryId: string, sourcePath: string, fileName: string): Promise<KnowledgeDocument> {
+    const store = this.requireStore()
+    const buffer = await readFile(sourcePath)
+    const text = await parseDocumentBuffer(buffer, fileName)
+    if (text.trim().length === 0) throw new Error(`file is empty or unreadable: ${fileName}`)
+    let rawFilePath: string | undefined
+    if (store.raw !== undefined) rawFilePath = await store.raw.write(baseId, crypto.randomUUID(), safeRawExtension(fileName), buffer)
+    try {
+      return await this.ingestDocument({
+        baseId,
+        title: fileName,
+        sourceType: 'file',
+        fileName,
+        parentDirectoryId,
+        rawFilePath,
+        sourcePath,
+        text,
+      })
+    } catch (error) {
+      if (rawFilePath !== undefined) await store.raw?.delete(rawFilePath)
+      throw error
     }
-    return document
+  }
+
+  /** Returns unchanged only when the live bytes exactly match the stored raw
+   * snapshot. A changed source is parsed once up front so an invalid on-disk
+   * replacement cannot be silently treated as a successful old-snapshot
+   * rebuild. */
+  private async syncDirectoryFile(document: KnowledgeDocument, sourcePath: string, fileName: string): Promise<'updated' | 'unchanged'> {
+    if (this.indexing.has(document.id)) throw new Error(`"${document.title}" is still being indexed — try again when it finishes`)
+    const store = this.requireStore()
+    const buffer = await readFile(sourcePath)
+    const bound = await this.bindDocumentSourcePath(document, sourcePath)
+    const stored = bound.rawFilePath !== undefined ? await store.raw?.read(bound.rawFilePath) : undefined
+    const unchanged = stored !== undefined && stored !== null && stored.byteLength > 0 && Buffer.from(stored).equals(buffer)
+    if (unchanged) return bound === document ? 'unchanged' : 'updated'
+    const text = await parseDocumentBuffer(buffer, fileName)
+    if (text.trim().length === 0) throw new Error(`file is empty or unreadable: ${fileName}`)
+    await this.reindexDocument(bound.id)
+    return 'updated'
+  }
+
+  private async deleteTrackedSyncSubtree(document: KnowledgeDocument, rootPath: string, items: DirectorySyncItem[]): Promise<void> {
+    const store = this.requireStore()
+    const byParent = new Map<string, KnowledgeDocument[]>()
+    for (const candidate of store.listDocuments(document.baseId)) {
+      if (candidate.parentDirectoryId === undefined) continue
+      const children = byParent.get(candidate.parentDirectoryId) ?? []
+      children.push(candidate)
+      byParent.set(candidate.parentDirectoryId, children)
+    }
+    const nodes: KnowledgeDocument[] = []
+    const collect = (node: KnowledgeDocument): void => {
+      nodes.push(node)
+      for (const child of byParent.get(node.id) ?? []) collect(child)
+    }
+    collect(document)
+    await this.deleteDocumentRecursive(document.id)
+    for (const node of nodes) {
+      items.push({
+        relativePath: node.sourcePath !== undefined ? this.relativeSourcePath(rootPath, node.sourcePath) : node.title,
+        kind: node.sourceType === 'directory' ? 'directory' : 'file',
+        documentId: node.id,
+        action: 'deleted',
+      })
+    }
   }
 
   async reindexBase(baseId: string): Promise<{ reindexed: number }> {
@@ -1804,6 +2042,7 @@ export class KnowledgeService extends Service {
     const store = this.requireStore()
     if (store.getBase(baseId) === undefined) throw new Error(`knowledge base not found: ${baseId}`)
     const documents = store.listDocuments(baseId)
+    const roots = this.outermostSelectedIds(documents.map(document => document.id))
     const jobId = crypto.randomUUID()
     this.pruneJobs()
     this.jobs.set(jobId, {
@@ -1812,13 +2051,13 @@ export class KnowledgeService extends Service {
       cancelled: false,
       imported: 0,
       skipped: 0,
-      total: documents.length,
+      total: roots.length,
       current: '',
       errors: [],
       done: false,
     })
     void this.runReindexJob(jobId, baseId)
-    return { jobId, total: documents.length }
+    return { jobId, total: roots.length }
   }
 
   /** Progress snapshot of an active (or just-finished) reindex job. */
@@ -1834,11 +2073,20 @@ export class KnowledgeService extends Service {
   private async runReindexJob(jobId: string, baseId: string): Promise<void> {
     const job = this.jobs.get(jobId)
     if (job === undefined) return
-    const documents = this.requireStore().listDocuments(baseId)
-    for (const doc of documents) {
+    const store = this.requireStore()
+    const roots = this.outermostSelectedIds(store.listDocuments(baseId).map(document => document.id))
+    for (const id of roots) {
       if (job.cancelled) break
+      const doc = store.getDocument(id)
+      if (doc === undefined) continue
       job.current = doc.title
-      if (doc.sourceType === 'directory') {
+      // Manually-created folders have no live source identity. They remain
+      // organizational containers, not background-sync roots.
+      if (doc.sourceType === 'directory' && doc.sourcePath === undefined) {
+        job.skipped += 1
+        continue
+      }
+      if (this.indexing.has(doc.id)) {
         job.skipped += 1
         continue
       }
@@ -1853,7 +2101,7 @@ export class KnowledgeService extends Service {
     job.current = ''
   }
 
-  async reindexDocuments(ids: readonly string[]): Promise<{ reindexed: number; skipped: number }> {
+  async reindexDocuments(ids: readonly string[]): Promise<ReindexDocumentsResult> {
     const store = this.requireStore()
     // Fold the selection to its outermost roots first (Cherry's
     // `getOutermostSelectedItemIds`): a directory and one of its descendants
@@ -1862,25 +2110,45 @@ export class KnowledgeService extends Service {
     // skipped and counted so the UI can tell the user (Cherry's bulk gate).
     let reindexed = 0
     let skipped = 0
+    let failed = 0
+    const items: DirectorySyncItem[] = []
     for (const id of this.outermostSelectedIds(ids)) {
-      if (store.getDocument(id) === undefined) continue
+      const document = store.getDocument(id)
+      if (document === undefined) continue
       if (this.indexing.has(id)) {
         skipped += 1
         continue
       }
-      await this.reindexDocument(id)
-      reindexed += 1
+      try {
+        const result = await this.reindexDocument(id)
+        reindexed += 1
+        if (result.sync !== undefined) {
+          items.push(...result.sync.items)
+          failed += result.sync.failed
+        }
+      } catch (error) {
+        failed += 1
+        items.push({
+          relativePath: document.title,
+          kind: document.sourceType === 'directory' ? 'directory' : 'file',
+          documentId: document.id,
+          action: 'failed',
+          error: this.directoryItemError(error),
+        })
+      }
     }
-    return { reindexed, skipped }
+    return { reindexed, skipped, failed, items }
   }
 
-  async deleteDocuments(ids: readonly string[]): Promise<{ deleted: number }> {
+  async deleteDocuments(ids: readonly string[], options?: { recursive?: boolean }): Promise<{ deleted: number }> {
     const store = this.requireStore()
     // Fold to outermost roots so a directory and its selected descendants are
-    // not deleted twice; deleteDocumentRecursive removes the whole subtree.
+    // not deleted twice. Preflight *all* roots before the first delete so a
+    // missing recursive confirmation can never produce a partial batch write.
+    const roots = this.assertDeleteImpacts(ids, options?.recursive === true)
     const touched = new Set<string>()
     let deleted = 0
-    for (const id of this.outermostSelectedIds(ids)) {
+    for (const id of roots) {
       const document = store.getDocument(id)
       if (document === undefined) continue
       await this.deleteDocumentRecursive(id)
@@ -1993,6 +2261,7 @@ export class KnowledgeService extends Service {
         fileName: doc.fileName,
         url: doc.url,
         ...(doc.parentDirectoryId !== undefined ? { parentDirectoryId: doc.parentDirectoryId } : {}),
+        ...(doc.sourcePath !== undefined ? { sourcePath: doc.sourcePath } : {}),
         charCount: doc.charCount,
         tokenCount: doc.tokenCount,
         chunkCount: doc.chunkCount,
@@ -2362,6 +2631,7 @@ export class KnowledgeService extends Service {
       sourceType: doc.sourceType,
       ...(doc.fileName !== undefined ? { fileName: doc.fileName } : {}),
       ...(doc.url !== undefined ? { url: doc.url } : {}),
+      ...(doc.sourcePath !== undefined ? { sourcePath: doc.sourcePath } : {}),
       ...(doc.rawFilePath !== undefined ? { rawFilePath: doc.rawFilePath } : {}),
       rawText: truncated ? rawText.slice(0, rawTextLimit) : rawText,
       ...(truncated ? { rawTextTruncated: true } : {}),

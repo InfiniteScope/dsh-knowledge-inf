@@ -8,7 +8,7 @@
 
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { ConflictError, type KnowledgeService } from './index.js'
+import { ConflictError, DirectorySourceError, type KnowledgeService } from './index.js'
 import type { ConfigOverrides } from './domain.js'
 import type {
   AddFileDocumentRequest,
@@ -76,6 +76,17 @@ async function handleRequest(service: KnowledgeService, req: IncomingMessage, re
     // conflict strategy instead of treating the import as a server error.
     if (error instanceof ConflictError) {
       writeJson(res, 409, { ok: false, error: { code: 'conflict', message: error.message } })
+      return
+    }
+    if (error instanceof DirectorySourceError) {
+      writeJson(res, 409, {
+        ok: false,
+        error: {
+          code: error.code,
+          message: error.message,
+          ...(error.details !== undefined ? { details: error.details } : {}),
+        },
+      })
       return
     }
     const message = error instanceof Error ? error.message : String(error)
@@ -366,7 +377,7 @@ async function route(
   // /documents/:id (and sub-resources) + bulk routes
   if (segments[0] === 'documents') {
     if (segments.length === 1) {
-      if (method === 'DELETE') return service.deleteDocuments(readIds(body))
+      if (method === 'DELETE') return service.deleteDocuments(readIds(body), { recursive: body.recursive === true })
       return undefined
     }
     if (segments.length === 2 && segments[1] === 'reindex' && method === 'POST') {
@@ -383,7 +394,10 @@ async function route(
         })
       }
       if (method === 'PATCH') return service.renameDocument(documentId, typeof body.title === 'string' ? body.title : '')
-      if (method === 'DELETE') return service.deleteDocument(documentId).then(() => ({ deleted: true }))
+      if (method === 'DELETE') {
+        return service.deleteDocument(documentId, { recursive: query.get('recursive') === 'true' || body.recursive === true })
+          .then(() => ({ deleted: true }))
+      }
       return undefined
     }
     if (segments.length === 3) {
@@ -391,6 +405,7 @@ async function route(
         return service.listChunks(documentId, readIntQuery(query, 'limit'), readIntQuery(query, 'offset'))
       }
       if (segments[2] === 'reindex' && method === 'POST') return service.reindexDocument(documentId)
+      if (segments[2] === 'delete-impact' && method === 'GET') return service.getDeleteImpact(documentId)
       if (segments[2] === 'refresh' && method === 'POST') return service.refreshUrlDocument(documentId)
       if (segments[2] === 'raw' && method === 'GET') {
         const raw = await service.getRawFile(documentId)

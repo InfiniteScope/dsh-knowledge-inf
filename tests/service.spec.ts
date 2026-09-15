@@ -805,7 +805,7 @@ describe('KnowledgeService', () => {
     const fileB = docs.find(doc => doc.title === 'b.txt')
     expect(fileB?.parentDirectoryId).toBe(subDir!.id)
 
-    await service.deleteDocument(rootDir!.id)
+    await service.deleteDocument(rootDir!.id, { recursive: true })
     expect(service.listDocuments(base.id)).toHaveLength(0)
 
     await rm(root, { recursive: true, force: true })
@@ -917,7 +917,7 @@ describe('KnowledgeService', () => {
 
     // Selecting the directory AND one of its descendants folds to the root:
     // the subtree is deleted once, everything below it goes with it.
-    const deleted = await service.deleteDocuments([root.id, leaf.id, top.id])
+    const deleted = await service.deleteDocuments([root.id, leaf.id, top.id], { recursive: true })
     expect(deleted.deleted).toBe(2) // root (with subtree) + top
     expect(service.listDocuments(base.id)).toHaveLength(0)
   })

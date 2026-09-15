@@ -97,6 +97,82 @@ export interface KnowledgeBase {
 /** Where a document's text came from. `directory` is a container of child items. */
 export type DocumentSourceType = 'text' | 'file' | 'url' | 'directory'
 
+/** One concrete mutation (or retained item) produced while synchronizing a
+ * tracked directory source with its live filesystem tree. */
+export type DirectorySyncAction = 'created' | 'updated' | 'unchanged' | 'deleted' | 'failed'
+
+/** An itemized, path-relative outcome of a directory synchronization. */
+export interface DirectorySyncItem {
+  /** Normalized path relative to the directory root; `.` denotes the root. */
+  readonly relativePath: string
+  readonly kind: 'file' | 'directory'
+  readonly documentId?: string
+  readonly action: DirectorySyncAction
+  readonly error?: { readonly code: string; readonly message: string }
+}
+
+/** Truthful aggregate result for initial directory import and later syncs. */
+export interface DirectorySyncResult {
+  readonly sourceId: string
+  readonly status: 'synced' | 'unchanged' | 'partial'
+  readonly created: number
+  readonly updated: number
+  readonly unchanged: number
+  readonly deleted: number
+  readonly failed: number
+  readonly items: readonly DirectorySyncItem[]
+}
+
+/** Additive result returned by the explicit directory-tree import endpoint. */
+export interface DirectoryImportResult {
+  /** Legacy file count retained for 0.3.x callers. */
+  readonly imported: number
+  /** Legacy directory count retained for 0.3.x callers. */
+  readonly directories: number
+  /** Legacy per-file error list retained for 0.3.x callers. */
+  readonly errors: readonly { readonly file: string; readonly error: string }[]
+  readonly sourceId: string
+  readonly mode: 'created' | 'synced'
+  readonly sync: DirectorySyncResult
+}
+
+/** Additive directory details returned by `importFromPath`. */
+export interface PathImportResult {
+  readonly kind: 'directory' | 'file'
+  readonly imported: number
+  readonly errors: readonly { readonly file: string; readonly error: string }[]
+  readonly directories?: number
+  readonly sourceId?: string
+  readonly mode?: 'created' | 'synced'
+  readonly sync?: DirectorySyncResult
+}
+
+/** Additive details for a batch reindex request. */
+export interface ReindexDocumentsResult {
+  readonly reindexed: number
+  readonly skipped: number
+  readonly failed: number
+  readonly items: readonly DirectorySyncItem[]
+}
+
+/** A document after reindexing. Directory containers additionally carry the
+ * synchronization report that produced their refreshed state. */
+export type ReindexDocumentResult = KnowledgeDocument & {
+  readonly sync?: DirectorySyncResult
+}
+
+/** The scope that would be removed by a document delete operation. */
+export interface DeleteImpact {
+  readonly documentId: string
+  readonly baseId: string
+  readonly directories: number
+  readonly files: number
+  readonly chunks: number
+  readonly rawSnapshots: number
+  /** True only when an explicit recursive confirmation is required. */
+  readonly requiresRecursive: boolean
+}
+
 /** One imported document inside a knowledge base. */
 export interface KnowledgeDocument {
   readonly id: string
@@ -315,6 +391,9 @@ export interface DocumentSummary {
   readonly fileName?: string
   readonly url?: string
   readonly parentDirectoryId?: string
+  /** Absolute live path for locally tracked files and directory containers.
+   * Administrative UI/API only; never included in model-facing search hits. */
+  readonly sourcePath?: string
   readonly charCount: number
   readonly tokenCount?: number
   readonly chunkCount: number
@@ -395,6 +474,8 @@ export interface DocumentDetail {
   readonly sourceType: DocumentSourceType
   readonly fileName?: string
   readonly url?: string
+  /** Absolute live path for a locally tracked source, when applicable. */
+  readonly sourcePath?: string
   /** Base-relative path of the persisted original source bytes (file docs). */
   readonly rawFilePath?: string
   readonly rawText?: string
