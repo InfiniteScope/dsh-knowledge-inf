@@ -8,7 +8,7 @@
 
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { ConflictError, DirectorySourceError, type KnowledgeService } from './index.js'
+import { ConflictError, DirectorySourceError, StorageUnavailableError, type KnowledgeService } from './index.js'
 import type { ConfigOverrides } from './domain.js'
 import type {
   AddFileDocumentRequest,
@@ -87,6 +87,12 @@ async function handleRequest(service: KnowledgeService, req: IncomingMessage, re
           ...(error.details !== undefined ? { details: error.details } : {}),
         },
       })
+      return
+    }
+    if (error instanceof StorageUnavailableError) {
+      // The durable backend exists but could not be opened. Answer 503 with the
+      // real cause so a caller never reads this as "the library is empty".
+      writeJson(res, 503, { ok: false, error: { code: 'storage_unavailable', message: error.message } })
       return
     }
     const message = error instanceof Error ? error.message : String(error)

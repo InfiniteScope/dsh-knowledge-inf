@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { knowledgeDomainSpec } from '../src/knowledge/domain.js'
 import { ChunkDatabase, hashEmbeddingText, migrateLegacyChunkFile } from '../src/knowledge/chunkdb.js'
-import { openStore } from '../src/knowledge/store.js'
+import { openStore, StorageUnavailableError } from '../src/knowledge/store.js'
 import type { StorageDomainFacility, Store } from '../src/knowledge/store.js'
 import { KnowledgeService } from '../src/knowledge/index.js'
 import type { Config } from '../src/knowledge/config.js'
@@ -262,22 +262,36 @@ describe('ChunkDatabase (per-chunk SQL layout)', () => {
     }
   })
 
-  it('skips the unit-file migration once the store already holds chunks', async () => {
+  it('resumes the unit-file migration per document instead of skipping it wholesale', async () => {
     const dir = await tempDir()
     try {
       const legacy = {
         unit: { name: 'knowledge', version: 0 },
         global: null,
-        tables: { bases: {}, documents: {}, chunks: { 'c1': { id: 'c1', docId: 'd1', baseId: 'b1', index: 0, text: 'a' } } },
+        tables: {
+          bases: {},
+          documents: {},
+          chunks: {
+            c1: { id: 'c1', docId: 'd1', baseId: 'b1', index: 0, text: 'never migrated' },
+            c2: { id: 'c2', docId: 'd9', baseId: 'b9', index: 0, text: 'already stored' },
+          },
+        },
       }
       const jsonPath = join(dir, 'knowledge.json')
       await writeFile(jsonPath, JSON.stringify(legacy))
 
       const db = new ChunkDatabase(join(dir, 'chunks.sqlite'))
+      // d9 was reached by a previous run; d1 was never reached because that run
+      // stopped early. A whole-store guard would strand d1 forever.
       db.putChunks([chunk('x1', 'd9', 'b9', 0, 'x')])
       const migrated = await migrateLegacyChunkFile(jsonPath, db, () => {})
-      expect(migrated).toBe(0)
-      expect(db.listChunksByDoc('d1')).toHaveLength(0)
+      expect(migrated).toBe(1)
+      expect(db.listChunksByDoc('d1')).toHaveLength(1)
+      // The document already in the store keeps its stored version.
+      expect(db.listChunksByDoc('d9').map(entry => entry.id)).toEqual(['x1'])
+
+      // Idempotent: a later run has nothing left to migrate.
+      expect(await migrateLegacyChunkFile(jsonPath, db, () => {})).toBe(0)
       db.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -1270,6 +1284,29 @@ describe('local-path import source tracking', () => {
       } finally {
         await closeStore(service)
       }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('storage failure reporting', () => {
+  it('reports storage unavailable instead of substituting an empty in-memory store', async () => {
+    const dir = await tempDir()
+    try {
+      // A plain file where the chunk-store directory must go makes the open fail
+      // AFTER the domain facility has already succeeded. Degrading to memory
+      // here would show an empty library while the data is intact on disk.
+      const blocker = join(dir, 'not-a-directory')
+      await writeFile(blocker, 'x', 'utf8')
+      const facility = { open: async () => fakeDomain() } as unknown as StorageDomainFacility
+      await expect(openStore(facility, { chunkStorePath: join(blocker, 'chunks.sqlite') }))
+        .rejects.toBeInstanceOf(StorageUnavailableError)
+
+      // The documented degradation still applies when there is no backend at all.
+      const memory = await openStore(undefined)
+      expect(memory.listBases()).toHaveLength(0)
+      await memory.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

@@ -243,6 +243,9 @@ export class ChunkDatabase implements RetrievalLane {
    * exact (per doc / per base), never a whole-store flush.
    */
   private readonly vectorCache = new Map<string, Array<{ id: string; docId: string; vector: Float32Array; row: ChunkRow }>>()
+  /** `PRAGMA data_version` observed when each base's cache was loaded, so a
+   *  write from another connection invalidates it instead of being invisible. */
+  private readonly vectorCacheDataVersion = new Map<string, number>()
 
   private static readonly SELECT_COLUMNS = 'chunk_id, doc_id, base_id, idx, text, heading, context, embedding, embedding_model'
 
@@ -324,37 +327,72 @@ export class ChunkDatabase implements RetrievalLane {
    * trigger stays a correct key — the UNIQUE index makes a violation loud.
    */
   private migrateFtsRowidColumn(): void {
+    // Guard on a PERSISTED MARKER, not on the schema text. A migration
+    // interrupted between CREATE VIRTUAL TABLE and 'rebuild' leaves a table
+    // whose SQL is exactly what the old textual check accepted
+    // (`fts.sql.includes('fts_rowid')`), so the rebuild was skipped forever and
+    // every lexical query silently returned nothing for pre-existing content.
+    // The marker is written inside the same transaction as the rebuild, so it
+    // can never exist for a half-applied migration; a store upgraded from an
+    // older build simply rebuilds once. (FTS5's own 'integrity-check' cannot be
+    // used here: on an external-content table it accepts an empty index.)
+    this.db.exec('CREATE TABLE IF NOT EXISTS chunk_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    if (this.readMeta('fts_rowid_migrated') === '1') return
+
     const columns = this.db.prepare('PRAGMA table_info(chunk)').all() as Array<{ name: string }>
-    if (!columns.some(column => column.name === 'fts_rowid')) {
-      this.db.exec('ALTER TABLE chunk ADD COLUMN fts_rowid INTEGER')
-    }
-    this.db.exec('UPDATE chunk SET fts_rowid = rowid WHERE fts_rowid IS NULL')
+    const hasFtsRowid = columns.some(column => column.name === 'fts_rowid')
     const fts = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunk_fts'").get() as { sql: string } | undefined
-    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS chunk_fts_rowid_uniq ON chunk(fts_rowid)')
-    // A fresh store (DDL above) already keys on fts_rowid; an older store needs
-    // its virtual table + triggers rebuilt before the backfilled key takes effect.
-    if (fts !== undefined && fts.sql.includes('fts_rowid')) return
-    this.db.exec('DROP TRIGGER IF EXISTS chunk_ai')
-    this.db.exec('DROP TRIGGER IF EXISTS chunk_ad')
-    this.db.exec('DROP TRIGGER IF EXISTS chunk_au')
-    this.db.exec('DROP TABLE IF EXISTS chunk_fts')
-    this.db.exec(`CREATE VIRTUAL TABLE chunk_fts USING fts5(
-      search_text, content='chunk', content_rowid='fts_rowid', tokenize='trigram'
-    )`)
-    this.db.exec(`CREATE TRIGGER chunk_ai AFTER INSERT ON chunk BEGIN
-      UPDATE chunk SET fts_rowid = (SELECT COALESCE(MAX(fts_rowid), 0) + 1 FROM chunk)
-        WHERE chunk_id = NEW.chunk_id;
-      INSERT INTO chunk_fts(rowid, search_text)
-      SELECT fts_rowid, search_text FROM chunk WHERE chunk_id = NEW.chunk_id;
-    END`)
-    this.db.exec(`CREATE TRIGGER chunk_ad AFTER DELETE ON chunk BEGIN
-      INSERT INTO chunk_fts(chunk_fts, rowid, search_text) VALUES ('delete', OLD.fts_rowid, OLD.search_text);
-    END`)
-    this.db.exec(`CREATE TRIGGER chunk_au AFTER UPDATE OF search_text ON chunk BEGIN
-      INSERT INTO chunk_fts(chunk_fts, rowid, search_text) VALUES ('delete', OLD.fts_rowid, OLD.search_text);
-      INSERT INTO chunk_fts(rowid, search_text) VALUES (NEW.fts_rowid, NEW.search_text);
-    END`)
-    this.db.exec(`INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild')`)
+    const keyedOnFtsRowid = fts !== undefined && fts.sql.includes('fts_rowid')
+
+    // The migration replaces the FTS table and its triggers in ~8 statements, so
+    // make it atomic: a partial application is what produced the state above.
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if (!hasFtsRowid) this.db.exec('ALTER TABLE chunk ADD COLUMN fts_rowid INTEGER')
+      this.db.exec('UPDATE chunk SET fts_rowid = rowid WHERE fts_rowid IS NULL')
+      this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS chunk_fts_rowid_uniq ON chunk(fts_rowid)')
+      if (!keyedOnFtsRowid) {
+        this.db.exec('DROP TRIGGER IF EXISTS chunk_ai')
+        this.db.exec('DROP TRIGGER IF EXISTS chunk_ad')
+        this.db.exec('DROP TRIGGER IF EXISTS chunk_au')
+        this.db.exec('DROP TABLE IF EXISTS chunk_fts')
+        this.db.exec(`CREATE VIRTUAL TABLE chunk_fts USING fts5(
+          search_text, content='chunk', content_rowid='fts_rowid', tokenize='trigram'
+        )`)
+        this.db.exec(`CREATE TRIGGER chunk_ai AFTER INSERT ON chunk BEGIN
+          UPDATE chunk SET fts_rowid = (SELECT COALESCE(MAX(fts_rowid), 0) + 1 FROM chunk)
+            WHERE chunk_id = NEW.chunk_id;
+          INSERT INTO chunk_fts(rowid, search_text)
+          SELECT fts_rowid, search_text FROM chunk WHERE chunk_id = NEW.chunk_id;
+        END`)
+        this.db.exec(`CREATE TRIGGER chunk_ad AFTER DELETE ON chunk BEGIN
+          INSERT INTO chunk_fts(chunk_fts, rowid, search_text) VALUES ('delete', OLD.fts_rowid, OLD.search_text);
+        END`)
+        this.db.exec(`CREATE TRIGGER chunk_au AFTER UPDATE OF search_text ON chunk BEGIN
+          INSERT INTO chunk_fts(chunk_fts, rowid, search_text) VALUES ('delete', OLD.fts_rowid, OLD.search_text);
+          INSERT INTO chunk_fts(rowid, search_text) VALUES (NEW.fts_rowid, NEW.search_text);
+        END`)
+      }
+      this.db.exec(`INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild')`)
+      this.writeMeta('fts_rowid_migrated', '1')
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {
+        // the original failure is the one worth reporting
+      }
+      throw error
+    }
+  }
+
+  private readMeta(key: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM chunk_meta WHERE key = ?').get(key) as { value?: string } | undefined
+    return row?.value
+  }
+
+  private writeMeta(key: string, value: string): void {
+    this.db.prepare('INSERT INTO chunk_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
   }
 
   /**
@@ -622,6 +660,19 @@ export class ChunkDatabase implements RetrievalLane {
    * - VACUUM rewrites into the WAL, so checkpoint again to release it.
    */
   reclaimSpace(): { vacuumed: boolean; reclaimedBytes: number } {
+    // Best-effort by contract, and it runs AFTER the delete has already been
+    // committed: a failing checkpoint, FTS optimize, or VACUUM (SQLITE_BUSY is
+    // the realistic case — the constructor explicitly supports a second
+    // connection on this file) must never surface as "the delete failed".
+    try {
+      return this.reclaimSpaceUnchecked()
+    } catch (error) {
+      console.warn(`dsh-knowledge: space reclamation failed after a delete: ${error instanceof Error ? error.message : String(error)}`)
+      return { vacuumed: false, reclaimedBytes: 0 }
+    }
+  }
+
+  private reclaimSpaceUnchecked(): { vacuumed: boolean; reclaimedBytes: number } {
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     const pageSize = this.readPragmaInt('page_size')
     const pageCount = this.readPragmaInt('page_count')
@@ -843,10 +894,16 @@ export class ChunkDatabase implements RetrievalLane {
     return { total, hits: scored.slice(0, limit) }
   }
 
-  /** Lazy-load a base's vectors into the cache (SQL once, then in-memory). */
+  /** Lazy-load a base's vectors into the cache (SQL once, then in-memory).
+   *  `PRAGMA data_version` changes when ANOTHER connection commits to this
+   *  file, so a second DSH process (or a second store instance) that deletes or
+   *  re-embeds chunks cannot leave this lane serving vectors for rows that are
+   *  gone — the "resurrect a deleted document" failure. Own writes do not bump
+   *  it, which is why the local write paths still update the cache in place. */
   private ensureVectorCache(baseId: string): Array<{ id: string; docId: string; vector: Float32Array; row: ChunkRow }> {
+    const dataVersion = this.readPragmaInt('data_version')
     const cached = this.vectorCache.get(baseId)
-    if (cached !== undefined) return cached
+    if (cached !== undefined && this.vectorCacheDataVersion.get(baseId) === dataVersion) return cached
     const rows = this.db.prepare(
       `SELECT ${ChunkDatabase.SELECT_COLUMNS} FROM chunk WHERE base_id = ? AND embedding IS NOT NULL`,
     ).all(baseId) as unknown as ChunkRow[]
@@ -857,6 +914,7 @@ export class ChunkDatabase implements RetrievalLane {
       })
       .filter((entry): entry is { id: string; docId: string; vector: Float32Array; row: ChunkRow } => entry !== undefined)
     this.vectorCache.set(baseId, entries)
+    this.vectorCacheDataVersion.set(baseId, dataVersion)
     return entries
   }
 
@@ -930,11 +988,17 @@ function normalizeBm25(raw: number): number {
 
 /**
  * One-time migration: move chunks out of the legacy JSON unit file into the
- * SQLite store. No-op when the store already has data or the file is absent.
- * @returns the number of documents migrated.
+ * SQLite store. No-op when the file is absent.
+ *
+ * Resumable on purpose: the previous guard skipped the whole migration as soon
+ * as the store held *any* row (`db.size > 0`), so a crash — or one bad record —
+ * after the first document left the remaining documents stranded in the legacy
+ * file forever, with a success-shaped return. Each document is now migrated
+ * only when the store holds none of its chunks yet.
+ *
+ * @returns the number of documents migrated by this call.
  */
 export async function migrateLegacyChunkFile(jsonPath: string, db: ChunkDatabase, log: (message: string) => void): Promise<number> {
-  if (db.size > 0) return 0
   let raw: string
   try {
     raw = await readFile(jsonPath, 'utf8')
@@ -962,11 +1026,17 @@ export async function migrateLegacyChunkFile(jsonPath: string, db: ChunkDatabase
       byDoc.set(chunk.docId, list)
     }
   }
+  const alreadyStored = db.docIdsWithChunks()
+  let migrated = 0
   for (const [docId, list] of byDoc) {
+    // Per-document guard: a previous run that stopped midway must resume the
+    // documents it never reached, and must never re-add one it already did.
+    if (alreadyStored.has(docId)) continue
     const byId = new Map<string, KnowledgeChunk>()
     for (const chunk of list) byId.set(chunk.id, chunk)
     db.putChunks([...byId.values()].sort((a, b) => a.index - b.index))
+    migrated += 1
   }
-  if (byDoc.size > 0) log(`dsh-knowledge: migrated ${byDoc.size} documents' chunks to the SQLite store`)
-  return byDoc.size
+  if (migrated > 0) log(`dsh-knowledge: migrated ${migrated} documents' chunks to the SQLite store`)
+  return migrated
 }

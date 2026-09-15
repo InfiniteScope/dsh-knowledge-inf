@@ -41,7 +41,7 @@ import { maximalMarginalRelevance, reciprocalRankFusion, RRF_K } from './retriev
 import type { RankedHit } from './retrieval.js'
 import { rerankCandidates, rerankErrorDetail, rerankTechnicalMessage } from './rerank.js'
 import { hashEmbeddingText } from './chunkdb.js'
-import { openStore } from './store.js'
+import { openStore, StorageUnavailableError } from './store.js'
 import type { StorageDomainFacility, Store } from './store.js'
 import {
   activeOllamaPulls as activeOllamaPullsHelper,
@@ -93,6 +93,7 @@ import type {
 
 export type * from './types.js'
 export { Config } from './config.js'
+export { openStore, StorageUnavailableError } from './store.js'
 export { knowledgeDomainSpec } from './domain.js'
 export { chunkText } from './chunk.js'
 export { composeContextWindow, estimateContextTokens, serializeContextWindow } from './context.js'
@@ -243,6 +244,9 @@ export class KnowledgeService extends Service {
 
   private readonly baseConfig: Config
   private store: Store | undefined
+  /** Set when the durable backend exists but could not be opened, so every
+   *  store-backed call can report the real reason instead of an empty library. */
+  private storageError: Error | undefined
   private readonly storeReady: Promise<void>
   private resolveStore: () => void = () => {}
   private readonly jobs = new Map<string, BackgroundJob>()
@@ -276,9 +280,28 @@ export class KnowledgeService extends Service {
     setLocalModelCacheDir(this.baseConfig.localModelCacheDir)
     setHfEndpoint(this.baseConfig.hfEndpoint)
     const facility = this.ctx.get('storageDomain') as StorageDomainFacility | undefined
-    this.store = await openStore(facility, { chunkStorePath: this.baseConfig.chunkStorePath })
+    try {
+      this.store = await openStore(facility, { chunkStorePath: this.baseConfig.chunkStorePath })
+    } catch (error) {
+      // The durable backend exists but could not be opened or healed. Keep the
+      // plugin alive so the failure is visible and diagnosable, but never
+      // substitute an in-memory store: that would present an empty library
+      // while the data sits intact on disk, and discard every later write.
+      this.storageError = error instanceof Error ? error : new Error(String(error))
+      this.ctx.logger.error(`knowledge: ${this.storageError.message}`)
+    }
     this.resolveStore()
     const store = this.store
+    // Teardown is registered unconditionally: without a store the plugin still
+    // answers status/model calls, so a local model worker it started must not
+    // outlive it.
+    this.ctx.effect(() => async () => { await store?.close() }, 'knowledge: close store')
+    // Terminate the local-model inference worker on teardown so a loaded
+    // ~600MB model can never outlive the plugin (Cherry: lifecycle-managed worker).
+    this.ctx.effect(() => () => { void disposeLocalModelWorker() }, 'knowledge: dispose local model worker')
+    this.ctx.effect(() => () => { void disposeLocalRerankProcess() }, 'knowledge: dispose local rerank process')
+    this.ctx.effect(() => () => { void disposeOcrWorker() }, 'knowledge: dispose OCR worker')
+    if (store === undefined) return
     // Reapply the RUNTIME overrides persisted in the domain (they survive
     // restarts): without this, a saved localModelCacheDir / hfEndpoint was
     // only live after the next explicit save — model downloads/checks and the
@@ -303,12 +326,6 @@ export class KnowledgeService extends Service {
         if (model?.status === 'unhealthy' && model.health === 'unchecked') void selfTestLocalModel(modelId)
       }
     }).catch(() => {})
-    this.ctx.effect(() => async () => { await store.close() }, 'knowledge: close store')
-    // Terminate the local-model inference worker on teardown so a loaded
-    // ~600MB model can never outlive the plugin (Cherry: lifecycle-managed worker).
-    this.ctx.effect(() => () => { void disposeLocalModelWorker() }, 'knowledge: dispose local model worker')
-    this.ctx.effect(() => () => { void disposeLocalRerankProcess() }, 'knowledge: dispose local rerank process')
-    this.ctx.effect(() => () => { void disposeOcrWorker() }, 'knowledge: dispose OCR worker')
     // Resume documents a previous process left mid-embedding: their chunks are
     // partially persisted, so re-running the embed with hash reuse completes
     // them without re-embedding the batches that already landed. (openStore
@@ -3703,7 +3720,15 @@ export class KnowledgeService extends Service {
   }
 
   private requireStore(): Store {
-    if (this.store === undefined) throw new Error('knowledge store is not ready')
+    if (this.store === undefined) {
+      // A durable backend that failed to open is NOT an empty library: report
+      // the real cause so the panel and the model both see "storage
+      // unavailable" instead of zero bases.
+      if (this.storageError !== undefined) {
+        throw new StorageUnavailableError(`knowledge storage is unavailable: ${this.storageError.message}`)
+      }
+      throw new Error('knowledge store is not ready')
+    }
     return this.store
   }
 }
