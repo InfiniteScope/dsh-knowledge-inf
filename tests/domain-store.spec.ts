@@ -1218,4 +1218,60 @@ describe('local-path import source tracking', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it('clears the crash-resumable marker when an import completes', async () => {
+    const dir = await tempDir()
+    try {
+      vi.stubEnv('DSH_HOME', dir)
+      const service = await mount(dir)
+      try {
+        const store = storeOf(service)
+        const base = await service.createBase({ name: 'completed import' })
+        const created = await service.addTextDocument({ baseId: base.id, title: 'note', content: 'a completed import body' })
+
+        // The pre-embedding write marks the row resumable; the completing write
+        // must drop the marker, or startup recovery treats every imported
+        // document as an interrupted import.
+        expect(store.getDocument(created.id)?.incomplete).toBeUndefined()
+
+        // The observable consequence: recovery finds nothing to resume.
+        const recovery = await store.recoverInterruptedImports(Date.now() + 1)
+        expect(recovery.resume).toEqual([])
+        expect(recovery.removed).toBe(0)
+      } finally {
+        await closeStore(service)
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('removes chunk rows left behind when a document row is already gone', async () => {
+    const dir = await tempDir()
+    try {
+      vi.stubEnv('DSH_HOME', dir)
+      const service = await mount(dir)
+      try {
+        const store = storeOf(service)
+        const base = await service.createBase({ name: 'orphans' })
+        const document = await service.addTextDocument({ baseId: base.id, title: 'orphan', content: 'orphan chunk body' })
+        expect(store.listChunks(base.id).length).toBeGreaterThan(0)
+
+        // Simulate a delete that landed while a batch was still in flight: the
+        // document row goes away first, the chunk rows are still there. Without
+        // reconciliation they keep matching lexical and vector search forever.
+        await store.deleteDocument(document.id)
+        expect(store.listChunks(base.id).length).toBeGreaterThan(0)
+
+        expect(await store.reconcileOrphanChunks()).toBe(1)
+        expect(store.listChunks(base.id)).toHaveLength(0)
+        // A second pass has nothing left to do.
+        expect(await store.reconcileOrphanChunks()).toBe(0)
+      } finally {
+        await closeStore(service)
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

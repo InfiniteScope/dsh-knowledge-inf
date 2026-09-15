@@ -690,6 +690,15 @@ export class ChunkDatabase implements RetrievalLane {
     return { withChunks, missingEmbedding }
   }
 
+  /** Every document id that still has chunk rows, for orphan reconciliation:
+   *  a delete that landed mid-embedding can leave batches behind whose document
+   *  row is already gone, and those rows would keep matching the retrieval
+   *  lanes (they scope by base, not by document existence) forever. */
+  docIdsWithChunks(): Set<string> {
+    const rows = this.db.prepare('SELECT DISTINCT doc_id FROM chunk').all() as Array<{ doc_id: string }>
+    return new Set(rows.map(row => row.doc_id))
+  }
+
   /** Aggregate chunk stats for `stats()`: counts, embedding presence/dimensions, model tags. */
   chunkStats(baseIds: readonly string[]): {
     count: number

@@ -324,7 +324,11 @@ export class KnowledgeService extends Service {
         for (const id of resumeIds) {
           const doc = store.getDocument(id)
           if (doc !== undefined) {
-            await store.putDocument({ ...doc, embeddingError: reason, errorCode: 'interrupted', updatedAt: Date.now() })
+            // Clear the resumable marker as part of the decision: leaving it set
+            // meant every later start re-marked the same document failed and
+            // overwrote its real embeddingError with `interrupted`, forever.
+            const { incomplete: _resumableMarker, ...rest } = doc
+            await store.putDocument({ ...rest, embeddingError: reason, errorCode: 'interrupted', updatedAt: Date.now() })
           }
         }
         this.ctx.logger.info(`knowledge: marked ${resumeIds.length} interrupted import(s) failed (auto-resume disabled)`)
@@ -619,7 +623,7 @@ export class KnowledgeService extends Service {
     await store.deleteBase(id)
     // A whole-base delete frees a large chunk of pages; hand them back to the
     // OS (threshold-gated, so a small base never pays for a VACUUM).
-    this.reclaimAfterDelete()
+    await this.reconcileAfterDelete()
     // Keep a selected id as a stale marker. If it was the last selected base,
     // enabledScope() must resolve to [] (fail closed), never broaden to all.
   }
@@ -1495,6 +1499,21 @@ export class KnowledgeService extends Service {
     await this.deleteDocumentRecursive(id)
     // One updatedAt write per delete, not per descendant.
     await this.touchBase(existing.baseId)
+    await this.reconcileAfterDelete()
+  }
+
+  /** Post-delete cleanup: drop chunk rows whose document is already gone (a
+   *  batch that landed after the row was deleted keeps matching the retrieval
+   *  lanes, which scope by base rather than by document existence), then
+   *  reclaim space. */
+  private async reconcileAfterDelete(): Promise<void> {
+    const store = this.requireStore()
+    try {
+      const removed = await store.reconcileOrphanChunks()
+      if (removed > 0) this.ctx.logger.warn(`knowledge: removed chunks left by ${removed} deleted document(s)`)
+    } catch (error) {
+      this.ctx.logger.warn(`knowledge: orphan chunk reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
     this.reclaimAfterDelete()
   }
 
@@ -2175,7 +2194,7 @@ export class KnowledgeService extends Service {
     }
     // One updatedAt write per affected base, not per document.
     for (const baseId of touched) await this.touchBase(baseId)
-    this.reclaimAfterDelete()
+    await this.reconcileAfterDelete()
     return { deleted }
   }
 
@@ -3444,11 +3463,22 @@ export class KnowledgeService extends Service {
     // A delete that landed mid-embedding must not resurrect the row nor write
     // chunks under a deleted base (Cherry's deleting-guard).
     if (store.getDocument(half.id) === undefined || store.getBase(input.baseId) === undefined) {
+      // A delete landed mid-embedding: the row is gone, so any batch that had
+      // already passed its liveness check must not survive as orphan chunks
+      // that keep matching the retrieval lanes.
+      await store.deleteChunks(half.id).catch(() => {})
       this.indexing.delete(half.id)
       return half
     }
+    // `half` carries the crash-resumable `incomplete` marker written before
+    // embedding. The completing write must drop it: leaving it set made startup
+    // recovery treat every imported document as an interrupted import, so a
+    // default restart re-indexed the whole library — and with auto-resume off,
+    // re-marked it failed on every start. `reindexDocument` clears it the same
+    // way.
+    const { incomplete: _resumableMarker, ...completed } = half
     const document: KnowledgeDocument = {
-      ...half,
+      ...completed,
       chunkCount: chunks.length,
       ...(embeddingError !== undefined
         ? { embeddingError, ...(embeddingErrorCode !== undefined ? { errorCode: embeddingErrorCode } : {}) }

@@ -176,6 +176,12 @@ export interface Store {
   recoverInterruptedImports(startedAt: number): Promise<{ removed: number; resume: string[] }>
   /** Remove raw source copies no document references (orphans from failed/duplicate imports). */
   reconcileOrphanRaws(): Promise<number>
+  /** Remove chunk rows whose document no longer exists — the mirror of
+   *  {@link reconcileOrphanRaws} for the chunk store. Returns how many orphaned
+   *  documents had their chunks removed. A delete that lands while a batch is
+   *  in flight can leave rows behind that keep matching the retrieval lanes
+   *  (they scope by base, not by document existence). */
+  reconcileOrphanChunks(): Promise<number>
   /** Aggregate chunk stats without loading chunk rows. */
   chunkStats(baseIds: readonly string[]): ChunkStats
   /** SQL-backed retrieval lanes (FTS5 + vector scan); absent on in-memory stores. */
@@ -245,6 +251,8 @@ export async function openStore(
       await store.reconcileChunkCounts()
       const orphaned = await store.reconcileOrphanRaws()
       if (orphaned > 0) console.warn(`dsh-knowledge: removed ${orphaned} orphaned raw source file(s) no document referenced`)
+      const orphanChunks = await store.reconcileOrphanChunks()
+      if (orphanChunks > 0) console.warn(`dsh-knowledge: removed chunks left by ${orphanChunks} deleted document(s)`)
       return store
     } catch (error) {
       // Fall through to memory on any open failure (no backend, version mismatch, …).
@@ -425,6 +433,22 @@ class DomainStore implements Store {
 
   chunkStats(baseIds: readonly string[]): ChunkStats {
     return this.chunkDb.chunkStats(baseIds)
+  }
+
+  async reconcileOrphanChunks(): Promise<number> {
+    const known = new Set<string>()
+    for (const base of this.listBases()) {
+      for (const doc of this.listDocuments(base.id)) known.add(doc.id)
+    }
+    let removed = 0
+    for (const docId of this.chunkDb.docIdsWithChunks()) {
+      if (known.has(docId)) continue
+      // deleteChunks batches the sweep, fires the FTS tombstones, and drops the
+      // doc from the vector cache — the same path a normal delete takes.
+      await this.chunkDb.deleteChunks(docId)
+      removed += 1
+    }
+    return removed
   }
 
   get retrievalLane(): RetrievalLane {
@@ -637,6 +661,11 @@ class MemoryStore implements Store {
 
   async reconcileOrphanRaws(): Promise<number> {
     // In-memory store keeps no raw files on disk.
+    return 0
+  }
+
+  async reconcileOrphanChunks(): Promise<number> {
+    // The in-memory store deletes chunks with their document in one op.
     return 0
   }
 
