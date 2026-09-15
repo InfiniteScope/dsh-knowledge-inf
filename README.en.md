@@ -184,6 +184,8 @@ The default local embedding model is `onnx-community/Qwen3-Embedding-0.6B-ONNX`,
 
 Models are cached under `<DSH_HOME>/cache/dsh-knowledge/local-models` by default. Set `hfEndpoint` in the panel or use the `HF_ENDPOINT` environment variable to choose a mirror. OCR defaults to `hf-mirror.com`; users outside China can use `https://huggingface.co`.
 
+A download is **not tied to the HTTP request that started it**: it keeps running in the background after that request returns, so closing the browser or letting a client time out never cancels it — progress stays visible through the local model status. Stopping a download requires an explicit cancel, and cancelling stops only an in-flight transfer: a complete, validated model is never deleted (that is what delete is for). The request budget is re-armed by progress, so a slow link is never killed for taking long; only a long stretch with no progress is treated as stuck.
+
 </details>
 
 ### Model-facing tools
@@ -319,7 +321,7 @@ Injected material is explicitly labelled as untrusted reference evidence and can
 | Empty or stale base/document filters | Only `undefined` means unrestricted; an empty set matches zero documents in both SQLite lanes | A filtering mistake cannot silently search the whole library |
 | Remote-rerank timeout or malformed output | Shared deadline, strict result-index and score validation, structured `rerank` status | Return the original recall order and do not apply a rerank threshold |
 | Local embedding or rerank hangs/crashes | Independent child processes, versioned strict IPC, hard-timeout termination, one clean embedding recovery, and separate lifecycles | Recover or degrade the affected operation without restarting DSH or the other local-model lane |
-| Incomplete or incompatible local weights | Require configuration, tokenizer files, and non-empty ONNX weights; write a runtime-versioned, file-fingerprinted readiness marker only after self-test | Search never downloads implicitly or treats “an ONNX file exists” as readiness |
+| Incomplete or incompatible local weights | Record each weights file's expected byte size during download and compare it on disk; **quarantine and remove** a cache that fails to load so the next attempt re-downloads. Cancelling a download stops only an in-flight transfer and **never** deletes a complete, validated model | A truncated file is no longer treated as downloaded and left failing forever; search never downloads implicitly or treats “an ONNX file exists” as readiness |
 | Repeated local-rerank failures | Total queue cap of 16; open a five-minute circuit after three consecutive timeout/crash/runtime/invalid-response failures, with one half-open probe | Prevent a broken model from repeatedly consuming process and latency budgets |
 | Partial replacement rebuild or directory rescan | Replace the committed source only after the new raw source, parse, and index succeed; retain per-file results | One failed item does not destroy the old version or hide successful siblings |
 | Missing release files or platform drift | Node 22.19/24/26 quality gates, Windows/Linux/macOS native tests, Windows/Linux tarball install-and-boot smoke, and manually triggered real local-model smoke | Both source builds and the published npm shape are continuously checked |

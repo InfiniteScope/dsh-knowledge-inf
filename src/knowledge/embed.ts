@@ -292,6 +292,9 @@ export function setLocalWorkerIdleTimeoutMs(ms: number): void {
 let localWorker: ChildProcess | null = null
 let localWorkerIdleTimer: ReturnType<typeof setTimeout> | null = null
 let localRequestSeq = 0
+/** Re-arms the in-flight request's budget when the child reports progress, for
+ *  operations whose duration is legitimately unbounded (download, first load). */
+let reArmActiveRequest: (() => void) | undefined
 let localActiveModelId: string | null = null
 const localPending = new Map<number, {
   operation: LocalEmbedOperation
@@ -344,8 +347,10 @@ function ensureLocalWorker(): ChildProcess {
       // A download/load can run for minutes (585MB model); each progress
       // report is proof the worker is alive, so keep the idle-release timer
       // from firing mid-download (it would terminate the worker and kill the
-      // request).
+      // request) and re-arm the request budget too, so a slow-but-progressing
+      // transfer is never killed for taking long.
       armIdleTimer()
+      reArmActiveRequest?.()
       return
     }
     if (!isLocalEmbedResponse(message)) {
@@ -368,7 +373,18 @@ function ensureLocalWorker(): ChildProcess {
       return
     }
     if (message.ok === false) {
-      pending.reject(new Error(`${message.error.code}: ${message.error.message}`))
+      const failure = new Error(`${message.error.code}: ${message.error.message}`)
+      // A failure the child reports about ITSELF is process-local state — an
+      // ONNX session that failed to initialize cannot heal inside the same
+      // process (a native binding that did not register stays unregistered, and
+      // the child is deliberately kept alive across idle releases). Retrying in
+      // the same child therefore cannot help, so replace it: that is what makes
+      // embedLocal's "one clean restart" a real restart. A failed `download` is a
+      // transport problem and keeps its child (and its resumable staging cache).
+      if (pending.operation === 'load' || pending.operation === 'embed') {
+        void terminateLocalWorker(failure)
+      }
+      pending.reject(failure)
       return
     }
     try {
@@ -451,19 +467,34 @@ function callWorker(
       return
     }
     const id = ++localRequestSeq
-    const timer = setTimeout(() => {
-      localPending.delete(id)
-      // An expired active inference could be holding a native session in an
-      // unknown state. Destroy only the child, never the DSH host process.
-      void terminateLocalWorker(new Error('local embedding process timed out'))
-      reject(new Error('local embedding process timed out'))
-    }, LOCAL_WORKER_REQUEST_TIMEOUT_MS)
-    timer.unref?.()
+    // A download or a first load legitimately runs for many minutes (585MB at
+    // ~650KB/s is roughly 16 minutes). Their progress IS the liveness proof, so
+    // those operations re-arm this budget on every progress event: it bounds a
+    // STALL rather than the total transfer. Everything else keeps a flat
+    // per-request ceiling.
+    const progressAware = operation === 'download' || operation === 'load'
+    let requestTimer: ReturnType<typeof setTimeout> | undefined
+    const armRequestTimer = (): void => {
+      requestTimer = setTimeout(() => {
+        localPending.delete(id)
+        // An expired active inference could be holding a native session in an
+        // unknown state. Destroy only the child, never the DSH host process.
+        void terminateLocalWorker(new Error('local embedding process timed out'))
+        reject(new Error('local embedding process timed out'))
+      }, LOCAL_WORKER_REQUEST_TIMEOUT_MS)
+      requestTimer.unref?.()
+    }
+    const clearRequestTimer = (): void => {
+      clearTimeout(requestTimer)
+      if (progressAware && reArmActiveRequest === armRequestTimer) reArmActiveRequest = undefined
+    }
+    if (progressAware) reArmActiveRequest = armRequestTimer
+    armRequestTimer()
     localPending.set(id, {
       operation,
       expectedCount: payload.texts?.length,
-      resolve: (value) => { clearTimeout(timer); resolve(value) },
-      reject: (error) => { clearTimeout(timer); reject(error) },
+      resolve: (value) => { clearRequestTimer(); resolve(value) },
+      reject: (error) => { clearRequestTimer(); reject(error) },
     })
     localActiveModelId = payload.modelId
     try {
@@ -480,7 +511,7 @@ function callWorker(
       })
     } catch (error) {
       localPending.delete(id)
-      clearTimeout(timer)
+      clearRequestTimer()
       reject(error instanceof Error ? error : new Error(String(error)))
     }
   })

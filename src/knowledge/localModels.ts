@@ -296,10 +296,22 @@ export async function cancelLocalModelDownload(id: string): Promise<LocalModelSu
   const descriptor = await findModel(id)
   if (descriptor.kind === 'embedding') await cancelLocalModel(id)
   else {
+    // Mirror the embedding policy (`cancelLocalModel`): cancelling a DOWNLOAD
+    // must never delete a complete, validated model, because that costs the user
+    // the whole re-download (the reporter's ~585MB case) and the model was the
+    // only way to clear a stuck worker. Cancel is a no-op once nothing is in
+    // flight — use `deleteLocalModel` to remove a finished model.
+    const live = liveRerankStatus.get(id)
+    if (live?.status !== 'downloading') {
+      return { ...descriptor, status: 'ready', health: live?.health ?? 'unchecked', progress: 100, message: '' }
+    }
     cancelledRerankers.add(id)
     await cancelLocalReranker(id)
     liveRerankStatus.delete(id)
     readinessCache.delete(id)
+    // The download was in flight, so whatever sits in the model directory is a
+    // partial artifact by definition. A completed model never reaches here (it
+    // reports `ready`, and the guard above returns early).
     await rm(join(localModelCacheDir(), id), { recursive: true, force: true }).catch(() => {})
   }
   return { ...descriptor, status: 'not_downloaded', health: 'unchecked', progress: 0, message: '' }

@@ -24,6 +24,7 @@ import {
   hasActiveLocalModelDownload,
   isLocalModelDownloaded,
   localModelCacheDir,
+  markLocalModelError,
   setHfEndpoint,
   setLocalModelCacheDir,
   setLocalWorkerIdleTimeoutMs,
@@ -193,6 +194,10 @@ const CONCEPT_GREP_SNIPPET_PAD = 60
 const CONCEPT_GREP_MAX_LINE_CHARS = 2000
 /** How long a finished job's final progress stays visible (Cherry's linger TTL). */
 const PROGRESS_LINGER_TTL_MS = 60_000
+/** A terminal indexing FAILURE stays visible far longer than an in-progress
+ *  linger: the reported embedding failure expired after 60s, so a user who
+ *  looked a minute later saw the job simply vanish with no recorded error. */
+const FAILURE_LINGER_TTL_MS = 10 * 60_000
 /** Embedding batch retry policy (Cherry's job retry contract). */
 const EMBED_MAX_ATTEMPTS = 3
 const EMBED_RETRY_BASE_DELAY_MS = 1000
@@ -982,7 +987,7 @@ export class KnowledgeService extends Service {
           phase: 'parsing',
           code: 'parse_failed',
           message: safeIndexingErrorMessage(message),
-          expireAt: Date.now() + PROGRESS_LINGER_TTL_MS,
+          expireAt: Date.now() + FAILURE_LINGER_TTL_MS,
         })
         try {
           await store.putDocument({ ...current, embeddingError: message, errorCode: 'parse_failed', updatedAt: Date.now() })
@@ -3657,7 +3662,26 @@ export class KnowledgeService extends Service {
       } catch (error) {
         embeddingError = error instanceof Error ? error.message : String(error)
         embeddingErrorCode ??= 'embedding_provider'
+        // Record it where /indexing-status can see it, with the REAL phase and
+        // code. Only the parse path used to write this map (and it hardcoded
+        // phase 'parsing'), so an embedding failure was visible as
+        // `phase: "embedding", progress: 0` and then vanished with no error.
+        // buildChunks serves both import and reindex, so this covers both.
+        this.indexingFailures.set(docId, {
+          baseId,
+          title,
+          phase: 'embedding',
+          code: embeddingErrorCode,
+          message: safeIndexingErrorMessage(embeddingError),
+          expireAt: Date.now() + FAILURE_LINGER_TTL_MS,
+        })
         this.ctx.logger.warn(`knowledge: embedding during import failed, storing lexical-only chunks: ${embeddingError}`)
+        // A local model that cannot embed must not keep reporting `ready` in the
+        // settings poller: previously only the download path marked an error, so
+        // every embed could fail while /local-model-status stayed green.
+        if (config.embeddingProvider === 'local' && config.embeddingModel.trim() !== '') {
+          markLocalModelError(config.embeddingModel, embeddingError)
+        }
       } finally {
         const active = this.indexing.get(docId)
         this.indexing.delete(docId)

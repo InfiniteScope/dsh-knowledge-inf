@@ -187,6 +187,11 @@ function spawnChild(): ChildProcess {
       && !argument.startsWith('--inspect')),
   })
   spawned.on('message', message => onMessage(message, generation))
+  // Every other spawn site (embed, ocr, pdf-parse) unrefs its handle. With an
+  // `ipc` stdio channel the parent otherwise holds a referenced handle, so a live
+  // rerank child keeps the host event loop alive — and `localWorkerIdleTimeoutMs: 0`
+  // ("keep models hot") is a documented, supported setting.
+  spawned.unref()
   spawned.on('error', error => {
     if (child !== spawned || intentionalExit) return
     child = null

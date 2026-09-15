@@ -9,6 +9,10 @@ class FakeChild extends EventEmitter {
   killed = false
   readonly requests: LocalRerankRequest[] = []
 
+  // The real ChildProcess is unref'd by the runtime (every spawn site does it so
+  // a live child cannot hold the host event loop open), so the double needs it.
+  unref(): this { return this }
+
   send(message: LocalRerankRequest): boolean {
     this.requests.push(message)
     if (state.mode === 'hang') return true
