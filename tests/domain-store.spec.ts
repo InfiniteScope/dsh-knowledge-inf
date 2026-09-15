@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Domain, KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { Context } from '@deepseek-ai/cordis'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { knowledgeDomainSpec } from '../src/knowledge/domain.js'
@@ -839,7 +839,7 @@ describe('local-path import source tracking', () => {
         const doc = store.listDocuments(base.id).find(d => d.sourceType === 'file')
         expect(doc).toBeDefined()
         expect(doc!.rawText).toContain('alpha')
-        expect(doc!.sourcePath).toBe(src1)
+        expect(doc!.sourcePath).toBe(await realpath(src1))
         const beforeHash = doc!.contentHash
 
         // Repoint the source to a different file and reindex: the reindex must
@@ -850,7 +850,7 @@ describe('local-path import source tracking', () => {
         expect(reindexed).toBeDefined()
         expect(reindexed!.rawText).toContain('beta')
         expect(reindexed!.contentHash).not.toBe(beforeHash)
-        expect(reindexed!.sourcePath).toBe(src2)
+        expect(reindexed!.sourcePath).toBe(await realpath(src2))
         // The persisted raw copy was refreshed to the new file's bytes.
         expect(decode(await store.raw!.read(reindexed!.rawFilePath!))).toContain('beta')
 
@@ -872,7 +872,7 @@ describe('local-path import source tracking', () => {
         // The directory root was NOT touched by the file repoint.
         const dirRoot = store.listDocuments(base.id).find(d => d.sourceType === 'directory')
         expect(dirRoot).toBeDefined()
-        expect(dirRoot!.sourcePath).toBe(mixed)
+        expect(dirRoot!.sourcePath).toBe(await realpath(mixed))
       } finally {
         await closeStore(service)
       }
@@ -941,6 +941,10 @@ describe('local-path import source tracking', () => {
       await writeFile(first, 'first source', 'utf8')
       await writeFile(second, 'second source', 'utf8')
       await writeFile(replacement, 'replacement source', 'utf8')
+      // A stored local source path is the resolved real path (macOS reaches its
+      // temp directory through the /var symlink), so expectations resolve too.
+      const [firstPath, secondPath, replacementPath] =
+        await Promise.all([realpath(first), realpath(second), realpath(replacement)])
 
       const service = await mount(dir)
       try {
@@ -948,16 +952,16 @@ describe('local-path import source tracking', () => {
         await service.importFromPath(base.id, first)
         await service.importFromPath(base.id, second)
         const store = storeOf(service)
-        const firstDoc = store.listDocuments(base.id).find(doc => doc.sourcePath === first)!
-        const secondDoc = store.listDocuments(base.id).find(doc => doc.sourcePath === second)!
+        const firstDoc = store.listDocuments(base.id).find(doc => doc.sourcePath === firstPath)!
+        const secondDoc = store.listDocuments(base.id).find(doc => doc.sourcePath === secondPath)!
 
         await expect(service.setBaseSourcePath(base.id, firstDoc.id, replacement))
           .resolves.toEqual({ set: 1 })
-        expect(store.getDocument(firstDoc.id)?.sourcePath).toBe(replacement)
-        expect(store.getDocument(secondDoc.id)?.sourcePath).toBe(second)
+        expect(store.getDocument(firstDoc.id)?.sourcePath).toBe(replacementPath)
+        expect(store.getDocument(secondDoc.id)?.sourcePath).toBe(secondPath)
         expect(service.listBases().find(row => row.id === base.id)?.sourceInfo).toEqual([
-          expect.objectContaining({ sourceId: firstDoc.id, sourcePath: replacement }),
-          expect.objectContaining({ sourceId: secondDoc.id, sourcePath: second }),
+          expect.objectContaining({ sourceId: firstDoc.id, sourcePath: replacementPath }),
+          expect.objectContaining({ sourceId: secondDoc.id, sourcePath: secondPath }),
         ])
       } finally {
         await closeStore(service)
@@ -1114,8 +1118,14 @@ describe('local-path import source tracking', () => {
         expect(first.mode).toBe('created')
         expect(first.sync?.status).toBe('synced')
         const store = storeOf(service)
+        // Stored local paths are resolved real paths, so the expectation is
+        // built from realpath too: macOS reaches its temp directory through the
+        // /var symlink, and only the resolved form is a stable identity.
+        const canonicalSource = await realpath(source)
+        const canonicalAlpha = join(canonicalSource, 'alpha.txt')
+        const canonicalBeta = join(canonicalSource, 'nested', 'beta.txt')
         const root = store.listDocuments(base.id).find(doc => doc.sourceType === 'directory' && doc.parentDirectoryId === undefined)!
-        const alphaDoc = store.listDocuments(base.id).find(doc => doc.sourcePath === alpha)!
+        const alphaDoc = store.listDocuments(base.id).find(doc => doc.sourcePath === canonicalAlpha)!
         expect(root).toBeDefined()
         expect(alphaDoc).toBeDefined()
 
@@ -1135,8 +1145,8 @@ describe('local-path import source tracking', () => {
         expect(synced.sync?.updated).toBeGreaterThanOrEqual(1)
         expect(synced.sync?.deleted).toBeGreaterThanOrEqual(1)
         expect(store.getDocument(alphaDoc.id)?.rawText).toContain('alpha changed from disk')
-        expect(store.getDocument(alphaDoc.id)?.sourcePath).toBe(alpha)
-        expect(store.listDocuments(base.id).find(doc => doc.sourcePath === beta)).toBeUndefined()
+        expect(store.getDocument(alphaDoc.id)?.sourcePath).toBe(canonicalAlpha)
+        expect(store.listDocuments(base.id).find(doc => doc.sourcePath === canonicalBeta)).toBeUndefined()
 
         // A direct file reindex now reads its live path too, not merely the
         // stored snapshot left by the original directory import.

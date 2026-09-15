@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { KnowledgeService } from '../src/knowledge/index.js'
@@ -1410,7 +1410,10 @@ describe('KnowledgeService', () => {
       const store = (service as unknown as { store: { getDocument(id: string): { id: string; title: string; sourceType: string; parentDirectoryId?: string; sourcePath?: string } | undefined } }).store
       const rootSummary = service.listDocuments(base.id).find(doc => doc.sourceType === 'directory' && doc.parentDirectoryId === undefined)
       const root = store.getDocument(rootSummary!.id)
-      expect(root?.sourcePath).toBe(resolve(src))
+      // A stored local source path is the resolved real path: on macOS the
+      // temp directory is reached through /var, which is a symlink to
+      // /private/var, and only the resolved form is a stable identity.
+      expect(root?.sourcePath).toBe(await realpath(src))
 
       // Disk changes: a.txt removed, c.txt added — the reindex must sync.
       await rm(join(src, 'a.txt'))

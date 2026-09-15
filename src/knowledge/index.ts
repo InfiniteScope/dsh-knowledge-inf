@@ -1178,6 +1178,20 @@ export class KnowledgeService extends Service {
     return canonical
   }
 
+  /** Canonical identity for any one local source path. Two spellings of the
+   * same real file — macOS `/var` versus `/private/var`, a symlink, or a
+   * Windows junction — must never become two sources, so every stored local
+   * path is written in its resolved form rather than the spelling the caller
+   * happened to use. A path that cannot be resolved falls back to its
+   * normalized form (validation has already proven it exists). */
+  private async canonicalSourcePath(path: string): Promise<string> {
+    try {
+      return await realpath(path)
+    } catch {
+      return resolve(path)
+    }
+  }
+
   /** Stable comparison key for paths that are already validated as local
    * sources. `resolve` normalizes separators; Windows uses case-insensitive
    * identity even when the physical volume preserves the original case. */
@@ -1243,7 +1257,11 @@ export class KnowledgeService extends Service {
   async importFileFromPath(baseId: string, filePath: string): Promise<{ imported: boolean; title: string }> {
     const store = this.requireStore()
     if (store.getBase(baseId) === undefined) throw new Error(`knowledge base not found: ${baseId}`)
+    // The user-facing name keeps the spelling they chose; the stored source
+    // identity is the resolved real path, so the same file reached twice
+    // through different spellings is still one source.
     const name = basename(filePath)
+    const sourcePath = await this.canonicalSourcePath(filePath)
     if (!SUPPORTED_DOCUMENT_EXTENSION_SET.has(extensionOf(name))) {
       throw new Error(`Unsupported knowledge file type: ${name}`)
     }
@@ -1265,7 +1283,7 @@ export class KnowledgeService extends Service {
         sourceType: 'file',
         fileName: name,
         rawFilePath,
-        sourcePath: filePath,
+        sourcePath,
         text,
       })
     } catch (error) {
@@ -1339,7 +1357,7 @@ export class KnowledgeService extends Service {
     }
     if (source.sourceType === 'directory') {
       if (!st.isDirectory()) throw new Error('a directory source must be repointed to a directory')
-      await store.putDocument({ ...source, sourcePath: trimmed, updatedAt: Date.now() })
+      await store.putDocument({ ...source, sourcePath: await this.canonicalSourcePath(trimmed), updatedAt: Date.now() })
     } else {
       if (!st.isFile()) throw new Error('a file source must be repointed to a file')
       const nextFileName = basename(trimmed)
@@ -1351,7 +1369,7 @@ export class KnowledgeService extends Service {
       const { mimeType: _staleMimeType, ...withoutMimeType } = source
       await store.putDocument({
         ...withoutMimeType,
-        sourcePath: trimmed,
+        sourcePath: await this.canonicalSourcePath(trimmed),
         fileName: nextFileName,
         updatedAt: Date.now(),
       })

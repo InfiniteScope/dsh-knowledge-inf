@@ -8,6 +8,7 @@
 - **Truthful sync results**: every import and directory reindex returns per-item `created` / `updated` / `unchanged` / `deleted` / `failed` outcomes with relative paths, and an aggregate `synced` / `unchanged` / `partial` status. Unchanged files are never reported as failures, and a sync that succeeds for most files while some fail returns `partial` with the successful work retained.
 - **Path-based identity**: directory children are matched by their actual source path. A legacy child with no stored path is adopted only when its name and kind are unique; two candidates are reported as `ambiguous_source` rather than resolved by a first-match guess. A tree that the old behaviour already duplicated is never merged, moved, or auto-deleted — the user inspects and removes it.
 - **Live reindex identity**: files imported from a directory retain `sourcePath`, so a single-file reindex re-reads the file from disk instead of replaying the stored snapshot. `sourcePath` is exposed on administrative document summaries and details, and is never included in model-facing search results.
+- **Resolved path identity**: every stored local source path is now the resolved real path, whether the source arrived as a directory tree, a single file, or a repoint. macOS reaches its temp directory through the `/var` symlink and Windows paths may go through a junction or a short name, so comparing the spelling a user typed would let one file become two sources. The management panel therefore displays the resolved path.
 
 ### Explicit destructive deletes
 
