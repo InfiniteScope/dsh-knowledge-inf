@@ -44,14 +44,15 @@ dsh-knowledge 把文档导入、解析、分块、检索、证据组织和模型
 - pnpm：`>=10`
 - 已安装并初始化 DeepSeek Harness
 
-在安装插件之前，将以下构建许可加入目标 profile 的 `pnpm-workspace.yaml`。这些依赖包含 postinstall；pnpm 10 默认拒绝执行时，`dsh plugin add` 会在登记 bundle 前退出。
+在安装插件之前，将以下构建许可**合并到**目标 profile 的 `pnpm-workspace.yaml` 中已有的 `allowBuilds` 映射。不要重复添加第二个 `allowBuilds:` 键，否则 YAML 会失效。这些依赖包含安装期构建；pnpm 10 默认拒绝执行时，`dsh plugin add` 会在登记 bundle 前退出。
 
 ```yaml
 allowBuilds:
+  esbuild: true
   onnxruntime-node: true
-  sharp: true
   protobufjs: true
-  tesseract.js: true
+  sharp: true
+  tesseract.js: false
 ```
 
 ### 2. 安装插件
@@ -84,6 +85,35 @@ dsh plugin --profile <name> add file:/path/to/dsh-knowledge
 ```
 
 如果第一次安装因 pnpm 构建许可失败，请补全 `allowBuilds` 后重新运行 add。包通常已经进入 `node_modules`，第二次执行会继续完成 bundle 登记。
+
+</details>
+
+<details>
+<summary>恢复 <code>ERR_PNPM_WORKSPACE_MANIFEST_WRITER_PARSE</code></summary>
+
+这表示 pnpm 无法解析 DSH profile 自己的 `pnpm-workspace.yaml`，发生在下载或构建本插件之前。先备份文件，再修复错误信息指出的 YAML 行：
+
+- Windows：`%USERPROFILE%\.dsh\profiles\<profile>\pnpm-workspace.yaml`
+- macOS / Linux：`~/.dsh/profiles/<profile>/pnpm-workspace.yaml`
+
+不要在不清楚原有设置用途时覆盖该文件。如果 profile 没有其他有意保留的 pnpm 设置，可恢复为以下最小有效配置，再将上方的 `allowBuilds` 合并进去：
+
+```yaml
+packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+
+allowBuilds:
+  esbuild: true
+  onnxruntime-node: true
+  protobufjs: true
+  sharp: true
+  tesseract.js: false
+```
+
+随后重新执行同一条 `dsh plugin --profile <profile> add ...` 命令。若修复 YAML 后出现 `ERR_PNPM_IGNORED_BUILDS`，这是独立的构建授权问题；仅按 pnpm 输出的确切包名补充授权，不要宽泛地允许所有脚本。
 
 </details>
 

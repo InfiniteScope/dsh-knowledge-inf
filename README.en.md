@@ -42,14 +42,15 @@ dsh-knowledge brings document ingestion, parsing, chunking, retrieval, evidence 
 - pnpm: `>=10`
 - An installed and initialized DeepSeek Harness profile
 
-Before installing the plugin, add the following build permissions to the target profile's `pnpm-workspace.yaml`. These dependencies contain postinstall scripts; when pnpm 10 blocks them, `dsh plugin add` exits before it can register the bundle.
+Before installing the plugin, **merge** the following build permissions into the target profile's existing `allowBuilds` mapping in `pnpm-workspace.yaml`. Do not add a second `allowBuilds:` key: duplicate YAML keys make the file invalid. These dependencies require installation-time builds; when pnpm 10 blocks them, `dsh plugin add` exits before it can register the bundle.
 
 ```yaml
 allowBuilds:
+  esbuild: true
   onnxruntime-node: true
-  sharp: true
   protobufjs: true
-  tesseract.js: true
+  sharp: true
+  tesseract.js: false
 ```
 
 ### 2. Install the plugin
@@ -82,6 +83,35 @@ dsh plugin --profile <name> add file:/path/to/dsh-knowledge
 ```
 
 If the first installation fails because pnpm blocked build scripts, add the `allowBuilds` entries and run the add command again. The package is normally already present in `node_modules`, and the second run completes bundle registration.
+
+</details>
+
+<details>
+<summary>Recover from <code>ERR_PNPM_WORKSPACE_MANIFEST_WRITER_PARSE</code></summary>
+
+This means pnpm could not parse the DSH profile's own `pnpm-workspace.yaml`; it happens before this plugin is downloaded or built. Back up the file first, then repair the YAML line named in the error:
+
+- Windows: `%USERPROFILE%\.dsh\profiles\<profile>\pnpm-workspace.yaml`
+- macOS / Linux: `~/.dsh/profiles/<profile>/pnpm-workspace.yaml`
+
+Do not overwrite the file if you do not know what its existing settings do. If the profile has no other intentional pnpm settings, it can be restored to this minimal valid configuration:
+
+```yaml
+packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+
+allowBuilds:
+  esbuild: true
+  onnxruntime-node: true
+  protobufjs: true
+  sharp: true
+  tesseract.js: false
+```
+
+Then rerun the same `dsh plugin --profile <profile> add ...` command. If YAML repair reveals `ERR_PNPM_IGNORED_BUILDS`, that is a separate build-approval error: add only the exact package key printed by pnpm, rather than broadly allowing scripts.
 
 </details>
 
