@@ -6,6 +6,10 @@
  * @module dsh-knowledge/knowledge/parse
  */
 
+import { existsSync } from 'node:fs'
+import { Worker } from 'node:worker_threads'
+import { fileURLToPath } from 'node:url'
+
 /**
  * The formats a knowledge import accepts (Cherry's `knowledgeSupportedFileExts`
  * plus json/log, which we decode as plain text). Anything else — binaries,
@@ -276,9 +280,7 @@ async function parsePdf(buffer: Uint8Array): Promise<string> {
   let primaryError: Error | null = null
   let text = ''
   try {
-    const pdfParse = await loadPdfParse()
-    const result = await pdfParse(Buffer.from(buffer))
-    text = typeof result?.text === 'string' ? result.text : ''
+    text = await parsePdfInWorker(buffer)
   } catch (error) {
     primaryError = error instanceof Error ? error : new Error(String(error))
   }
@@ -469,10 +471,91 @@ function stripXmlText(xml: string, tag: string): string {
 
 // ── lazy loaders ─────────────────────────────────────────────────────────────
 
-async function loadPdfParse(): Promise<(buffer: Buffer) => Promise<{ text?: string }>> {
-  // pdf-parse v1 is CommonJS; the default export is the parser function.
+// ── pdf-parse worker client ──────────────────────────────────────────────────
+// pdf-parse v1 leaks an unhandled rejection on documents that fail to load (see
+// pdf-parse-worker.ts). Its own thread keeps that stray rejection out of the
+// host process on every Node version, and gives each call a hard timeout so a
+// wedged parse cannot pin an import forever.
+
+/** Per-request ceiling; a PDF the engine cannot finish must not block an import. */
+const PDF_PARSE_WORKER_TIMEOUT_MS = 120_000
+
+let pdfParseWorker: Worker | null = null
+let pdfParseRequestSeq = 0
+/** Set once the worker bundle is known to be absent (a partial install). */
+let pdfParseWorkerMissing = false
+const pdfParsePending = new Map<number, { resolve(text: string): void; reject(error: Error): void }>()
+
+function failAllPdfParsePending(error: Error): void {
+  for (const { reject } of pdfParsePending.values()) reject(error)
+  pdfParsePending.clear()
+}
+
+function ensurePdfParseWorker(): Worker {
+  if (pdfParseWorker !== null) return pdfParseWorker
+  const worker = new Worker(fileURLToPath(new URL('./pdf-parse-worker.mjs', import.meta.url)))
+  worker.unref()
+  worker.on('message', (message: { id?: number; ok?: boolean; text?: string; error?: string }): void => {
+    if (message.id === undefined) return
+    const pending = pdfParsePending.get(message.id)
+    if (pending === undefined) return
+    pdfParsePending.delete(message.id)
+    if (message.ok === true) pending.resolve(message.text ?? '')
+    else pending.reject(new Error(message.error ?? 'pdf-parse worker failed'))
+  })
+  const onFailure = (error: Error): void => {
+    if (pdfParseWorker !== worker) return
+    failAllPdfParsePending(error)
+    pdfParseWorker = null
+  }
+  worker.on('error', error => onFailure(error instanceof Error ? error : new Error(String(error))))
+  worker.on('exit', () => onFailure(new Error('pdf-parse worker exited')))
+  pdfParseWorker = worker
+  return worker
+}
+
+function postPdfParseRequest(bytes: Uint8Array): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const id = ++pdfParseRequestSeq
+    const timer = setTimeout(() => {
+      pdfParsePending.delete(id)
+      const worker = pdfParseWorker
+      pdfParseWorker = null
+      failAllPdfParsePending(new Error('pdf-parse worker timed out'))
+      void worker?.terminate()
+      reject(new Error('PDF parsing failed: pdf-parse timed out'))
+    }, PDF_PARSE_WORKER_TIMEOUT_MS)
+    timer.unref?.()
+    pdfParsePending.set(id, {
+      resolve: text => { clearTimeout(timer); resolve(text) },
+      reject: error => { clearTimeout(timer); reject(error) },
+    })
+    try {
+      // postMessage structured-clones the bytes, so the caller's buffer stays
+      // usable (an import reuses the same bytes for raw storage and OCR).
+      ensurePdfParseWorker().postMessage({ id, data: Uint8Array.from(bytes) })
+    } catch (error) {
+      pdfParsePending.delete(id)
+      clearTimeout(timer)
+      reject(error instanceof Error ? error : new Error(String(error)))
+    }
+  })
+}
+
+/** Degraded path for an install with no worker bundle: parsing still works, but
+ *  pdf-parse's stray rejection is no longer contained. */
+async function parsePdfInProcess(bytes: Uint8Array): Promise<string> {
   const mod = await import('pdf-parse')
-  return mod.default
+  const result = await mod.default(Buffer.from(bytes))
+  return typeof result?.text === 'string' ? result.text : ''
+}
+
+async function parsePdfInWorker(bytes: Uint8Array): Promise<string> {
+  if (!pdfParseWorkerMissing && !existsSync(fileURLToPath(new URL('./pdf-parse-worker.mjs', import.meta.url)))) {
+    pdfParseWorkerMissing = true
+    console.warn('[dsh-knowledge] pdf-parse worker bundle is missing; parsing PDFs in-process')
+  }
+  return pdfParseWorkerMissing ? parsePdfInProcess(bytes) : postPdfParseRequest(bytes)
 }
 
 async function loadMammoth(): Promise<{ extractRawText(input: { buffer: Buffer }): Promise<{ value?: string }> }> {

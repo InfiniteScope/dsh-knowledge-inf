@@ -22,6 +22,8 @@ const REQUIRED_FILES = [
   'lib/knowledge/index.js',
   'lib/knowledge/embed-process.mjs',
   'lib/knowledge/rerank-process.mjs',
+  'lib/knowledge/ocr-worker.mjs',
+  'lib/knowledge/pdf-parse-worker.mjs',
   'lib/tool-knowledge/index.js',
   'lib/client.js',
 ]

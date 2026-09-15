@@ -117,6 +117,29 @@ describe('local OCR fallback', () => {
     await expect(parseDocumentBuffer(makeScannedPdf(8, 20, 20), 'scan.pdf', 'application/pdf'))
       .rejects.toThrow(/no extractable text|PDF parsing failed/)
   })
+
+  it('keeps a failing pdf-parse run from leaking a host-level rejection', async () => {
+    // pdf-parse v1 bundles pdf.js v1.10, whose failure path leaves an
+    // unhandled rejection behind: getDocument throws before the local doc is
+    // assigned, so the library's unawaited doc.destroy() never runs. Node 22
+    // escalates that stray rejection to a process-level unhandled rejection, so
+    // without the dedicated worker thread this test fails on Node 22.19 with
+    // "Vitest caught 1 unhandled error" while every assertion still passes.
+    const leaked: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { leaked.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      await expect(parseDocumentBuffer(makeScannedPdf(8, 20, 20), 'scan.pdf', 'application/pdf'))
+        .rejects.toThrow(/no extractable text|PDF parsing failed/)
+      await expect(parseDocumentBuffer(Buffer.from('this is not a pdf at all %%%'), 'broken.pdf', 'application/pdf'))
+        .rejects.toThrow(/PDF parsing failed/)
+      // Give any stray rejection created by the failed loads time to surface.
+      await new Promise(resolve => setTimeout(resolve, 1500))
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+    expect(leaked).toEqual([])
+  })
 })
 
 describe('pdfjs scanned-raster decode (real pipeline)', () => {

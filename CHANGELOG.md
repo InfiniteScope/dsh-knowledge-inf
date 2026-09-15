@@ -20,6 +20,12 @@
 - Isolated local embedding and rerank workers recover from a crashed or interrupted runtime instead of failing permanently.
 - Rerank readiness is finalized after normal inference, and retrieval reports the status of each lane so a degraded lane is visible rather than silent.
 
+### PDF parsing can no longer leak a host-level rejection
+
+- `pdf-parse` v1 bundles pdf.js v1.10, whose failure path leaks an unhandled rejection: `getDocument` throws before the library's local `doc` is ever assigned, so its unawaited `doc.destroy()` never runs and the half-built worker leaves a promise rejecting with nobody attached. Node 22 escalates that stray rejection to a process-level unhandled rejection, so importing a scanned or corrupt PDF reported an unhandled error in the host process — and failed CI on Node 22.19 while every assertion still passed.
+- pdf-parse now runs in its own worker thread, the same containment the OCR worker already uses for Tesseract.js and the embed/rerank processes use for onnxruntime. The stray rejection is recorded in that thread with a bounded, prefixed message and never reaches the host; the caller still receives a clean parse failure and falls through to pdfjs-dist layout extraction, OCR, and anydoc exactly as before.
+- A per-request ceiling means a PDF the engine cannot finish reports a clear failure instead of pinning an import indefinitely, and an install missing the worker bundle logs one warning and parses in-process rather than hanging.
+
 ### Compatibility and quality
 
 - The release is additive and migration-free: 0.3.9 data directories start without a database migration, re-embedding, forced reindex, legacy directory cleanup, or model download. Existing fields and call signatures keep working; the sync result, `sourcePath` accessor, delete-impact preview, and `recursive` argument are additions.

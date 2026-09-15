@@ -92,6 +92,12 @@ const hostEntries = [
   // OCR inference worker: Tesseract.js rethrows worker errors on
   // process.nextTick, so it must run in its own thread (own-worker OCR).
   ['src/knowledge/ocr-worker.ts', 'lib/knowledge/ocr-worker.mjs'],
+  // pdf-parse worker: pdf-parse v1 leaks an unhandled rejection when a document
+  // fails to load (its unawaited doc.destroy() never runs), which Node 22
+  // escalates to a host-level unhandled rejection on every scanned/corrupt PDF.
+  // Plain .mjs on purpose: a worker thread is started by Node's own loader, so
+  // the same relative URL has to resolve in src/ (tests) and lib/ (runtime).
+  ['src/knowledge/pdf-parse-worker.mjs', 'lib/knowledge/pdf-parse-worker.mjs'],
 ]
 
 for (const [entry, outfile] of hostEntries) {
