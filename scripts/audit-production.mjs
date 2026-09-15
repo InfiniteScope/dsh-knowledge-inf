@@ -6,11 +6,33 @@ import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
-const APPROVED_ADVISORY = 'GHSA-f88m-g3jw-g9cj'
-const REVIEW_DEADLINE = '2026-09-30T23:59:59.999Z'
-const EXPECTED_PATH_FRAGMENT = '@huggingface/transformers>sharp'
+/**
+ * Narrow, expiring exceptions for @huggingface/transformers 3.x.
+ *
+ * The plugin invokes only text feature-extraction and text-classification
+ * pipelines, never sharp's image decoding APIs. Transformers 3.x constrains
+ * sharp to ^0.34.x, while the patched libvips/libheif binaries require 0.35.x.
+ * Keep these exceptions exact and short-lived so a new advisory, dependency
+ * path, or version can never be accepted implicitly.
+ */
+const APPROVED_RISKS = Object.freeze([
+  {
+    id: 'GHSA-f88m-g3jw-g9cj',
+    module: 'sharp',
+    versionPrefix: '0.34.',
+    pathFragment: '@huggingface/transformers>sharp',
+    reviewDeadline: '2026-10-14T23:59:59.999Z',
+  },
+  {
+    id: 'GHSA-rgj7-g3m4-5g8c',
+    module: 'sharp',
+    versionPrefix: '0.34.',
+    pathFragment: '@huggingface/transformers>sharp',
+    reviewDeadline: '2026-10-14T23:59:59.999Z',
+  },
+])
 
-/** Evaluate pnpm's audit JSON while allowing one exact, time-bounded risk. */
+/** Evaluate pnpm's audit JSON while allowing only exact, time-bounded risks. */
 export function evaluateAudit(report, now = new Date()) {
   if (report === null || typeof report !== 'object' || Array.isArray(report)) {
     return { ok: false, approved: [], blocking: ['audit output is not a JSON object'] }
@@ -30,27 +52,28 @@ export function evaluateAudit(report, now = new Date()) {
     if (severity !== 'high' && severity !== 'critical') continue
     const id = String(advisory.github_advisory_id ?? advisory.id ?? 'unknown')
     const findings = Array.isArray(advisory.findings) ? advisory.findings : []
-    const expectedFinding = findings.length > 0 && findings.every(finding => {
+    const policy = APPROVED_RISKS.find(candidate => candidate.id === id)
+    const expectedFinding = policy !== undefined && findings.length > 0 && findings.every(finding => {
       const paths = Array.isArray(finding?.paths) ? finding.paths : []
       const version = String(finding?.version ?? '')
       return paths.length > 0
-        && paths.every(path => typeof path === 'string' && path.includes(EXPECTED_PATH_FRAGMENT))
-        && version.startsWith('0.34.')
+        && paths.every(path => typeof path === 'string' && path.includes(policy.pathFragment))
+        && version.startsWith(policy.versionPrefix)
         && finding.dev === false
     })
-    const isApproved = id === APPROVED_ADVISORY
-      && advisory.module_name === 'sharp'
+    const isApproved = policy !== undefined
+      && advisory.module_name === policy.module
       && severity === 'high'
       && expectedFinding
     if (!isApproved) {
       blocking.push(`${id}: ${severity} ${String(advisory.title ?? advisory.module_name ?? 'dependency advisory')}`)
       continue
     }
-    if (now.getTime() > Date.parse(REVIEW_DEADLINE)) {
-      blocking.push(`${id}: approved exception expired on ${REVIEW_DEADLINE.slice(0, 10)}`)
+    if (now.getTime() > Date.parse(policy.reviewDeadline)) {
+      blocking.push(`${id}: approved exception expired on ${policy.reviewDeadline.slice(0, 10)}`)
       continue
     }
-    approved.push(`${id}: accepted until ${REVIEW_DEADLINE.slice(0, 10)} (${EXPECTED_PATH_FRAGMENT})`)
+    approved.push(`${id}: accepted until ${policy.reviewDeadline.slice(0, 10)} (${policy.pathFragment})`)
   }
   return { ok: blocking.length === 0, approved, blocking }
 }
@@ -60,7 +83,15 @@ function selfTest() {
     advisories: {
       1: {
         id: 1,
-        github_advisory_id: APPROVED_ADVISORY,
+        github_advisory_id: 'GHSA-f88m-g3jw-g9cj',
+        module_name: 'sharp',
+        severity: 'high',
+        title: 'fixture',
+        findings: [{ version: '0.34.1', paths: ['.>@huggingface/transformers>sharp'], dev: false }],
+      },
+      2: {
+        id: 2,
+        github_advisory_id: 'GHSA-rgj7-g3m4-5g8c',
         module_name: 'sharp',
         severity: 'high',
         title: 'fixture',
@@ -68,8 +99,14 @@ function selfTest() {
       },
     },
   }
-  assert.equal(evaluateAudit(accepted, new Date('2026-08-30T00:00:00Z')).ok, true)
-  assert.equal(evaluateAudit(accepted, new Date('2026-10-01T00:00:00Z')).ok, false)
+  assert.equal(evaluateAudit(accepted, new Date('2026-09-14T00:00:00Z')).ok, true)
+  assert.equal(evaluateAudit(accepted, new Date('2026-10-15T00:00:00Z')).ok, false)
+  assert.equal(evaluateAudit({
+    advisories: { 3: { github_advisory_id: 'GHSA-rgj7-g3m4-5g8c', module_name: 'sharp', severity: 'high', findings: [{ version: '0.35.4', paths: ['.>@huggingface/transformers>sharp'], dev: false }] } },
+  }).ok, false)
+  assert.equal(evaluateAudit({
+    advisories: { 4: { github_advisory_id: 'GHSA-rgj7-g3m4-5g8c', module_name: 'sharp', severity: 'high', findings: [{ version: '0.34.1', paths: ['.>another-package>sharp'], dev: false }] } },
+  }).ok, false)
   assert.equal(evaluateAudit({ advisories: {} }).ok, true)
   assert.equal(evaluateAudit({
     advisories: { 2: { github_advisory_id: 'GHSA-unexpected', module_name: 'other', severity: 'critical', findings: [] } },

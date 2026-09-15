@@ -81,10 +81,10 @@ const hostEntries = [
   ['src/index.ts', 'lib/index.js'],
   ['src/knowledge/index.ts', 'lib/knowledge/index.js'],
   ['src/tool-knowledge/index.ts', 'lib/tool-knowledge/index.js'],
-  // Local embedding inference worker: a separate ESM bundle loaded by
-  // worker_threads at runtime (Cherry Studio's own-worker model), so
-  // transformers.js and its ~600MB model never run in the host process.
-  ['src/knowledge/embed-worker.ts', 'lib/knowledge/embed-worker.mjs'],
+  // Local embedding inference process: a separate ESM bundle loaded via
+  // child_process IPC, so a native ONNX crash or timeout can be recovered
+  // without restarting DSH itself.
+  ['src/knowledge/embed-process.ts', 'lib/knowledge/embed-process.mjs'],
   // Local cross-encoder reranking runs in a child process, not the embedding
   // worker, so a hard timeout can terminate it without blocking embeddings or
   // reloading onnxruntime in a replacement worker thread on Linux.

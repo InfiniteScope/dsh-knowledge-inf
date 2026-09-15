@@ -150,9 +150,9 @@ dsh plugin --profile <name> add file:/path/to/dsh-knowledge
 <details>
 <summary>本地模型运行方式</summary>
 
-默认本地 embedding 模型为 `onnx-community/Qwen3-Embedding-0.6B-ONNX`，约 585 MB、1024 维。它在独立 worker thread 中运行，空闲后可以释放 ONNX session，但 worker 保持存活以避免 Linux 原生绑定重复注册问题。
+默认本地 embedding 模型为 `onnx-community/Qwen3-Embedding-0.6B-ONNX`，约 585 MB、1024 维。它在带版本 IPC 的独立 child process 中运行；空闲时可释放 ONNX session，崩溃或硬超时后只重建干净的子进程，无需重启 DSH。下载使用模型专属 staging 目录，只有隔离加载和真实向量 probe 成功后才会提升到正式缓存，并写入带文件指纹的 readiness marker。
 
-`rerankModel: local:Xenova/bge-reranker-base` 在独立 child process 中运行，与 embedding worker 隔离。搜索不会隐式下载 rerank 模型；模型必须先在本地模型页面下载并通过健康检查。自定义 Hugging Face ONNX reranker 属于实验性能力，需要通过单 logit 能力验证和正负样例自检。
+`rerankModel: local:Xenova/bge-reranker-base` 在另一个独立 child process 中运行，与 embedding process 生命周期完全隔离。搜索不会隐式下载 rerank 模型；模型必须先在本地模型页面下载并通过健康检查。自定义 Hugging Face ONNX reranker 属于实验性能力，需要通过单 logit 能力验证和正负样例自检。
 
 本地模型默认缓存在 `<DSH_HOME>/cache/dsh-knowledge/local-models`。下载端点可通过界面的 `hfEndpoint` 或环境变量 `HF_ENDPOINT` 调整；OCR 默认使用 `hf-mirror.com`，海外用户可改为 `https://huggingface.co`。
 
@@ -289,11 +289,11 @@ dsh-knowledge 的检索目标不只是返回一组 Top K 文本，而是生成�
 |---|---|---|
 | 空或失效的知识库/文档过滤 | `undefined` 才表示不限制；空集合明确匹配零文档，SQLite 词法和向量路均 fail-closed | 不会因过滤错误意外搜索全部资料 |
 | 远程 rerank 超时或响应异常 | 共享 deadline、严格索引和分数校验、结构化 `rerank` 状态 | 返回原始召回结果，不误用 rerank 阈值 |
-| 本地 rerank 卡死或崩溃 | 独立 child process、硬超时终止、按需重建，与 embedding worker 分离 | 当前搜索降级，embedding 生命周期不被连带重启 |
+| 本地 embedding 或 rerank 卡死、崩溃 | 两个独立 child process、版本化严格 IPC、硬超时终止、embedding 单次干净恢复、生命周期分离 | 只恢复或降级受影响的操作，不必重启 DSH，也不连带影响另一条本地模型链路 |
 | 本地模型文件不完整或不兼容 | 检查配置、tokenizer 和非空 ONNX 权重；自检通过后写入带文件指纹和运行时版本的 readiness marker | 搜索不隐式下载，也不会把“目录里有 ONNX”误判为可用 |
 | 连续本地 rerank 故障 | 队列总上限 16；连续 3 次 timeout/crash/runtime/invalid-response 后熔断 5 分钟，并限制半开探测 | 避免故障模型持续占用进程和延迟预算 |
 | 替换重建或目录扫描部分失败 | 新 raw source、解析结果和索引成功后才替换已提交来源；逐文件保留结果 | 单个失败不破坏旧版本，也不掩盖同批成功项 |
-| 插件发布物缺文件或跨平台差异 | Node 22.19/24 质量门槛、Windows/Linux/macOS 原生测试、Windows/Linux tarball 安装启动测试、可选真实本地 rerank smoke | npm tarball 与源码构建均受到自动化发布检查 |
+| 插件发布物缺文件或跨平台差异 | Node 22.19/24/26 质量门槛、Windows/Linux/macOS 原生测试、Windows/Linux tarball 安装启动测试、手动触发的真实本地模型 smoke | npm tarball 与源码构建均受到自动化发布检查 |
 
 这些约束的共同原则是：范围错误时宁可返回空，排序增强失败时宁可保留基础召回，涉及已提交资料时宁可保留旧版本。降级原因会通过结构化状态或界面提示暴露，而不是静默伪装成成功。
 
@@ -301,14 +301,14 @@ dsh-knowledge 的检索目标不只是返回一组 Top K 文本，而是生成�
 
 ## 架构
 
-一个 bundle 挂载三个插件行。本地 embedding 与 OCR 分别运行在独立 worker thread，本地 rerank 运行在可终止和重建的 child process；本地推理故障不会直接进入 DSH host 的执行空间。
+一个 bundle 挂载三个插件行。本地 embedding 与本地 rerank 分别运行在可终止、可重建的独立 child process，OCR 仍运行在独立 worker thread；本地推理故障不会直接进入 DSH host 的执行空间。
 
 | 组件 | 平台 | 职责 |
 |---|---|---|
 | `knowledge`（`ctx.knowledge`） | host | 存储、分块、embedding/解析调度、检索、OCR 调度及 `/knowledge/*` HTTP 服务 |
 | `tool-knowledge` | host | 注册并执行 14 个模型工具 |
 | `ui-knowledge` | client | 侧边栏入口、工作区管理面板及同源 API 调用 |
-| `embed-worker` | worker thread | transformers.js 本地 embedding 推理；大模型不进入 host 进程 |
+| `embed-process` | child process | transformers.js 本地 embedding 推理；严格 IPC、staging/readiness probe 与可恢复的原生模型生命周期 |
 | `ocr-worker` | worker thread | mupdf 页面渲染、PaddleOCR、OpenCV 和 Tesseract 识别 |
 | `rerank-process.mjs` | child process | 本地 cross-encoder 重排、超时隔离和进程级恢复 |
 
@@ -400,7 +400,7 @@ dsh-knowledge 的定位是“一体化文档知识库”，而不是宣称所有
 | `autoRetrieve` | `true` | 用户消息进入时自动检索并注入相关背景 |
 | `autoRetrieveWeight` | `3` | 每库自动注入席位上限，范围 0–5；`0` 表示排除 |
 | `localModelCacheDir` | `''` | 空值使用 `<DSH_HOME>/cache/dsh-knowledge/local-models` |
-| `localWorkerIdleTimeoutMs` | `60000` | 本地 embedding worker 空闲释放模型的时间；`0` 表示常驻 |
+| `localWorkerIdleTimeoutMs` | `60000` | 本地 embedding process 空闲释放模型 session 的时间；`0` 表示常驻 |
 | `chunkStorePath` | `''` | 空值使用 `<DSH_HOME>/storages/knowledge-chunks.sqlite` |
 
 按库设置中的空字段继承全局配置。`localModelCacheDir`、`localWorkerIdleTimeoutMs` 和 `chunkStorePath` 是进程级设置。API Key 以明文保存在本地机器，请保护 profile 数据目录。

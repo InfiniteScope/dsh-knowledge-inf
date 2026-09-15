@@ -11,6 +11,28 @@ export type EmbeddingProvider = 'openai' | 'ollama' | 'local' | 'none'
 /** Search strategy. `auto` picks hybrid when vectors exist, else lexical. */
 export type SearchMode = 'auto' | 'hybrid' | 'vector' | 'lexical'
 
+/** Meaning of the normalized `SearchResult` / `SearchHit` score. */
+export type SearchScoreKind = 'lexical_relevance' | 'vector_similarity' | 'rrf' | 'rerank'
+
+/** Execution report for one retrieval lane.  This describes the work that
+ * actually happened; it is deliberately independent of which hits survived
+ * the final Top-K cut. */
+export interface RetrievalLaneStatus {
+  readonly attempted: boolean
+  readonly succeeded: boolean
+  readonly returnedCount: number
+  readonly errorCode?: string
+}
+
+/** Explicit retrieval execution diagnostics.  Added in 0.3.10 so callers no
+ * longer have to infer hybrid execution from score fields on individual hits. */
+export interface RetrievalStatus {
+  readonly requestedMode: SearchMode
+  readonly effectiveMode: SearchMode
+  readonly lexical: RetrievalLaneStatus
+  readonly vector: RetrievalLaneStatus
+}
+
 /** Per-base configuration overrides (Cherry Studio: every base picks its own model). */
 export interface BaseConfig {
   readonly embeddingProvider?: EmbeddingProvider
@@ -483,6 +505,11 @@ export interface SearchRequest {
 export interface SearchResult {
   readonly query: string
   readonly mode: SearchMode
+  /** Always emitted by current services; optional for source compatibility
+   * with consumers compiled against older 0.3.x declarations. */
+  readonly scoreKind?: SearchScoreKind
+  /** Always emitted by current services; optional for source compatibility. */
+  readonly retrieval?: RetrievalStatus
   readonly total: number
   readonly reranked: boolean
   /** Structured diagnostics for a configured reranker. Omitted when disabled. */

@@ -140,7 +140,8 @@ export function renderKnowledgeSearchResult(
     : ''
   if (value.hits.length === 0) return `${warning}no matches for "${value.query}"`
 
-  const header = `${warning}${value.hits.length} result(s) for "${value.query}" (${value.mode}):\n`
+  const scoreKind = value.scoreKind === undefined ? '' : `, ${value.scoreKind}`
+  const header = `${warning}${value.hits.length} result(s) for "${value.query}" (${value.mode}${scoreKind}):\n`
   const top = value.hits[0]
   const continuation = top === undefined
     ? ''
@@ -263,6 +264,29 @@ export function apply(ctx: Context): void {
         properties: {
           query: { type: 'string', required: true },
           mode: { type: 'string', required: true },
+          scoreKind: { type: 'string', enum: ['lexical_relevance', 'vector_similarity', 'rrf', 'rerank'] },
+          retrieval: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              requestedMode: { type: 'string', required: true },
+              effectiveMode: { type: 'string', required: true },
+              lexical: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  attempted: { type: 'boolean', required: true }, succeeded: { type: 'boolean', required: true },
+                  returnedCount: { type: 'number', required: true }, errorCode: { type: 'string' },
+                },
+              },
+              vector: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  attempted: { type: 'boolean', required: true }, succeeded: { type: 'boolean', required: true },
+                  returnedCount: { type: 'number', required: true }, errorCode: { type: 'string' },
+                },
+              },
+            },
+          },
           total: { type: 'number', required: true },
           reranked: { type: 'boolean', required: true },
           rerank: {

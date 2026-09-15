@@ -179,6 +179,11 @@ async function handle(request: LocalRerankRequest): Promise<LocalRerankSuccessRe
   }
   if (request.operation === 'load') {
     await ensureRunner(request)
+    // `createRunner()` reports validating while it opens the local ONNX
+    // session. A plain load used by a normal search never enters selfTest(),
+    // so it must publish its terminal state here as well. Otherwise the main
+    // process permanently gates the next query as `model_checking` (#18).
+    progress(request.modelId, 'ready', 100)
     return { protocolVersion: LOCAL_RERANK_PROTOCOL_VERSION, id: request.id, operation: 'load', ok: true }
   }
   if (request.operation === 'self_test') {
@@ -186,6 +191,10 @@ async function handle(request: LocalRerankRequest): Promise<LocalRerankSuccessRe
   }
   const runner = await ensureRunner(request)
   const scores = await runner.rerank(request.query, request.texts)
+  // A rerank can be the first operation after an idle child restart. Mark it
+  // ready only after scoring completed, so readiness reflects a usable model
+  // rather than a merely spawned process.
+  progress(request.modelId, 'ready', 100)
   return { protocolVersion: LOCAL_RERANK_PROTOCOL_VERSION, id: request.id, operation: 'rerank', ok: true, scores }
 }
 

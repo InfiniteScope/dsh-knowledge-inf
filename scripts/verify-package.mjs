@@ -20,11 +20,13 @@ const REQUIRED_FILES = [
   'scripts/verify-build-policy.mjs',
   'lib/index.js',
   'lib/knowledge/index.js',
+  'lib/knowledge/embed-process.mjs',
   'lib/knowledge/rerank-process.mjs',
   'lib/tool-knowledge/index.js',
   'lib/client.js',
 ]
 const FORBIDDEN_PREFIXES = ['src/', 'tests/', 'node_modules/', '.git/', '.github/', 'docs/superpowers/']
+const FORBIDDEN_FILES = ['lib/knowledge/embed-worker.mjs', 'lib/knowledge/embed-worker.mjs.map']
 
 function executable(name) {
   return process.platform === 'win32' ? `${name}.cmd` : name
@@ -81,6 +83,7 @@ async function main() {
     for (const path of REQUIRED_FILES) if (!files.has(path)) errors.push(`packed artifact is missing ${path}`)
     for (const path of files) {
       if (FORBIDDEN_PREFIXES.some(prefix => path.startsWith(prefix))) errors.push(`packed artifact exposes forbidden path ${path}`)
+      if (FORBIDDEN_FILES.includes(path)) errors.push(`packed artifact exposes obsolete runtime ${path}`)
       if (path.endsWith('.tgz')) errors.push(`packed artifact contains nested tarball ${path}`)
     }
     if (!files.has(`docs/releases/v${pkg.version}.md`)) errors.push(`packed artifact is missing docs/releases/v${pkg.version}.md`)

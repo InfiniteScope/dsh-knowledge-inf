@@ -1,29 +1,33 @@
 /**
- * Local model inference worker — Cherry Studio's "in its own worker" model:
+ * Local model inference process — Cherry Studio's isolated-runtime model:
  * transformers.js / onnxruntime run off the main process, so the ~600MB
  * embedding model (and any local reranker) plus every inference intermediate
- * tensor lives in this worker's heap and can never freeze the host process.
+ * tensor lives outside the host process and can never freeze it.
  *
- * Wire protocol (JSON messages over parentPort):
- *   main → worker:  { id, type: 'embed'|'load'|'rerank', modelId, cacheDir, hfEndpoint?, texts?, query?, pooling?, task? }
- *                    { type: 'cancel'|'release', modelId }
- *                    { type: 'shutdown' }
- *   worker → main:  { id, ok: true, vectors? | scores? } | { id, ok: false, error }
+ * Wire protocol (versioned IPC over a worker port or child-process IPC):
+ *   main → process: { protocolVersion, id, operation, modelId, cacheDir, ... }
+ *   process → main: { protocolVersion, id, operation, ok, vectors? | error }
  *                    { type: 'progress', modelId, status, progress, message }
  *
- * Inference is serialized inside the worker (Cherry's inference queue has
+ * Inference is serialized inside the process (Cherry's inference queue has
  * concurrency 1 for the same reason: transformers.js gives no concurrency
  * guarantee for parallel runs on one pipeline instance).
- * @module dsh-knowledge/knowledge/embed-worker
+ * @module dsh-knowledge/knowledge/embed-process
  */
 
 import { parentPort } from 'node:worker_threads'
 import { join } from 'node:path'
-import { readdir } from 'node:fs/promises'
+import { readdir, stat } from 'node:fs/promises'
 import { applyGlobalProxy, NETWORK_HINT } from './net.js'
+import {
+  LOCAL_EMBED_PROTOCOL_VERSION,
+  isLocalEmbedRequest,
+  type LocalEmbedRequest,
+  type LocalEmbedOperation,
+} from './embed-protocol.js'
 
-// The worker is a fresh thread: the main process's global undici dispatcher
-// does not carry over, so route model downloads through the system proxy here.
+// The child has its own global dispatcher, so route model downloads through
+// the system proxy here.
 applyGlobalProxy()
 
 interface TransformersModule {
@@ -53,24 +57,6 @@ interface TransformersModule {
 function sigmoid(value: number): number {
   return 1 / (1 + Math.exp(-value))
 }
-
-interface EmbedRequest {
-  id: number
-  type: 'embed' | 'load' | 'rerank'
-  modelId: string
-  cacheDir: string
-  hfEndpoint?: string
-  texts?: string[]
-  query?: string
-  pooling?: 'last_token' | 'cls' | 'mean'
-  task?: ModelTask
-}
-
-type WorkerMessage = EmbedRequest
-  | { type: 'cancel'; modelId: string }
-  | { type: 'release'; modelId: string }
-  | { type: 'release-models' }
-  | { type: 'shutdown' }
 
 type Pooling = 'last_token' | 'cls' | 'mean'
 type ModelTask = 'feature-extraction' | 'reranking'
@@ -103,7 +89,8 @@ function enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 function post(message: unknown): void {
-  parentPort?.postMessage(message)
+  if (parentPort !== null) parentPort.postMessage(message)
+  else process.send?.(message)
 }
 
 async function loadTransformers(): Promise<TransformersModule> {
@@ -120,8 +107,22 @@ function applyEndpoint(tf: TransformersModule, hfEndpoint: string | undefined): 
 
 async function isDownloaded(modelId: string, cacheDir: string): Promise<boolean> {
   try {
-    const entries = await readdir(join(cacheDir, modelId, 'onnx'))
-    return entries.some(name => name.endsWith('.onnx'))
+    const root = join(cacheDir, modelId)
+    const [config, entries, tokenizer] = await Promise.all([
+      stat(join(root, 'config.json')),
+      readdir(join(root, 'onnx')),
+      Promise.any([
+        stat(join(root, 'tokenizer.json')),
+        stat(join(root, 'tokenizer_config.json')),
+        stat(join(root, 'vocab.txt')),
+        stat(join(root, 'spiece.model')),
+      ]),
+    ])
+    if (config.size <= 0 || tokenizer.size <= 0) return false
+    for (const name of entries) {
+      if (name.endsWith('.onnx') && (await stat(join(root, 'onnx', name))).size > 0) return true
+    }
+    return false
   } catch {
     return false
   }
@@ -132,6 +133,7 @@ async function createRunner(
   modelId: string,
   cacheDir: string,
   hfEndpoint: string | undefined,
+  forceDownload = false,
 ): Promise<Runner> {
   const tf = await loadTransformers()
   applyEndpoint(tf, hfEndpoint)
@@ -144,7 +146,7 @@ async function createRunner(
 
   // 1. Download through the repo id (progress reported); discard the pipeline
   //    so it does not pin ~600MB — inference reloads from disk below.
-  if (!(await isDownloaded(modelId, cacheDir))) {
+  if (forceDownload || !(await isDownloaded(modelId, cacheDir))) {
     post({ type: 'progress', modelId, status: 'downloading', progress: 0, message: '' })
     const progressCallback = (info: { status?: string; progress?: number }): void => {
       // Cancellation is checked on EVERY callback (never throttled) so
@@ -193,11 +195,11 @@ async function createRunner(
 
   // 2. Load from the absolute cache directory: an absolute path is not a valid
   //    HF repo id, so transformers.js treats it as a local model and never
-  //    touches the network.
-  post({ type: 'progress', modelId, status: 'ready', progress: 100, message: '' })
+  //    touches the network. `ready` is emitted only after this load succeeds.
   if (task === 'reranking') {
     const model = await tf.AutoModel.from_pretrained(join(cacheDir, modelId), { dtype: 'q8' })
     const tokenizer = await tf.AutoTokenizer.from_pretrained(join(cacheDir, modelId))
+    post({ type: 'progress', modelId, status: 'ready', progress: 100, message: '' })
     return {
       // Cross-encoder relevance scoring, hand-rolled for transformers.js
       // versions without the `reranking` pipeline: tokenize [query, doc]
@@ -239,6 +241,7 @@ async function createRunner(
     | (((text: string | string[], options?: Record<string, unknown>) => Promise<{ tolist(): unknown }>) & { dispose?(): Promise<void> })
     | (((query: string, texts: string[], options?: Record<string, unknown>) => Promise<Array<{ score: number }>>) & { dispose?(): Promise<void> })
   const embed = pipeline as (text: string | string[], options?: Record<string, unknown>) => Promise<{ tolist(): unknown }>
+  post({ type: 'progress', modelId, status: 'ready', progress: 100, message: '' })
   return {
     embed: async (texts: string[], pooling: Pooling): Promise<number[][]> => {
       const output = await embed(texts, { pooling, normalize: true })
@@ -250,11 +253,11 @@ async function createRunner(
   }
 }
 
-function getRunner(task: ModelTask, modelId: string, cacheDir: string, hfEndpoint: string | undefined): Promise<Runner> {
+function getRunner(task: ModelTask, modelId: string, cacheDir: string, hfEndpoint: string | undefined, forceDownload = false): Promise<Runner> {
   const key = `${task}:${modelId}`
   const cached = runners.get(key)
   if (cached !== undefined) return cached
-  const pending = createRunner(task, modelId, cacheDir, hfEndpoint)
+  const pending = createRunner(task, modelId, cacheDir, hfEndpoint, forceDownload)
   runners.set(key, pending)
   // A failed load (network down, cancelled download, corrupt cache) must not
   // poison the map: drop it so the next request retries instead of reusing a
@@ -301,54 +304,46 @@ async function disposeRunnersFor(modelId: string): Promise<void> {
   }
 }
 
-parentPort?.on('message', (message: WorkerMessage): void => {
-  if (message.type === 'shutdown') {
-    process.exit(0)
-    return
-  }
-  if (message.type === 'cancel') {
-    // Interrupt an in-flight download (its progress callback throws); a
-    // loaded runner stays usable until the files are removed. The marker
-    // auto-expires so a later re-download of the same model is not blocked
-    // forever by the old cancellation.
-    cancelledModels.add(message.modelId)
-    setTimeout(() => {
-      cancelledModels.delete(message.modelId)
-    }, 30_000).unref?.()
-    return
-  }
-  if (message.type === 'release-models') {
-    // Idle release: unload the loaded MODELS (frees ~600MB), keep the worker
-    // alive. A respawn would re-dlopen onnxruntime's native binding, which on
-    // Linux fails with "Module did not self-register" — so the worker is
-    // never terminated on idle; the next request reloads from disk (~1s).
-    void enqueueOperation(disposeAllRunners)
-      .finally(() => post({ type: 'released', modelId: '' }))
-    return
-  }
-  if (message.type === 'release') {
-    // Drop the loaded runner so the ~600MB model can be garbage-collected,
-    // then ack so the main process can delete the files without hitting a
-    // file lock (onnxruntime may still hold handles until the runner is
-    // released and collected).
-    void enqueueOperation(() => disposeRunnersFor(message.modelId))
-      .finally(() => post({ type: 'released', modelId: message.modelId }))
-    return
-  }
-  const { id, type, modelId, cacheDir, hfEndpoint } = message
-  const task = message.task ?? 'feature-extraction'
+function handleMessage(message: unknown): void {
+  if (!isLocalEmbedRequest(message)) return
+  const { id, operation, modelId, cacheDir, hfEndpoint } = message
   void enqueueOperation(async () => {
-    const runner = await getRunner(task, modelId, cacheDir, hfEndpoint)
-    if (type === 'load') {
-      return { id, ok: true }
+    if (operation === 'shutdown') {
+      await disposeAllRunners()
+      return { protocolVersion: LOCAL_EMBED_PROTOCOL_VERSION, id, operation, ok: true as const }
     }
-    if (type === 'rerank') {
-      return { id, ok: true, scores: await runner.rerank!(message.query ?? '', message.texts ?? []) }
+    if (operation === 'release') {
+      await disposeRunnersFor(modelId)
+      return { protocolVersion: LOCAL_EMBED_PROTOCOL_VERSION, id, operation, ok: true as const }
     }
-    return { id, ok: true, vectors: await runner.embed!(message.texts ?? [], message.pooling ?? 'mean') }
+    // `download` intentionally follows the same load path: transformers.js
+    // downloads missing artifacts and then verifies that the local pipeline
+    // can actually be opened before the manager marks it ready.
+    const runner = await getRunner('feature-extraction', modelId, cacheDir, hfEndpoint, operation === 'download')
+    if (operation === 'download' || operation === 'load') {
+      return { protocolVersion: LOCAL_EMBED_PROTOCOL_VERSION, id, operation, ok: true as const }
+    }
+    const vectors = await runner.embed!(message.texts ?? [], message.pooling ?? 'mean')
+    return { protocolVersion: LOCAL_EMBED_PROTOCOL_VERSION, id, operation, ok: true as const, vectors }
   })
-    .then(post)
-    .catch((error: unknown) => {
-      post({ id, ok: false, error: error instanceof Error ? error.message : String(error) })
+    .then(response => {
+      post(response)
+      if (operation === 'shutdown') setImmediate(() => process.exit(0))
     })
-})
+    .catch((error: unknown) => {
+      post({
+        protocolVersion: LOCAL_EMBED_PROTOCOL_VERSION,
+        id,
+        operation: operation as LocalEmbedOperation,
+        ok: false as const,
+        error: {
+          code: 'runtime_error' as const,
+          message: error instanceof Error ? error.message : String(error),
+          retryable: true,
+        },
+      })
+    })
+}
+
+if (parentPort !== null) parentPort.on('message', handleMessage)
+else process.on('message', handleMessage)

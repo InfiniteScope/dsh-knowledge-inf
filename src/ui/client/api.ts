@@ -222,6 +222,13 @@ export interface ContextWindow {
 export interface SearchResult {
   query: string
   mode: SearchMode
+  scoreKind?: 'lexical_relevance' | 'vector_similarity' | 'rrf' | 'rerank'
+  retrieval?: {
+    requestedMode: SearchMode
+    effectiveMode: SearchMode
+    lexical: { attempted: boolean; succeeded: boolean; returnedCount: number; errorCode?: string }
+    vector: { attempted: boolean; succeeded: boolean; returnedCount: number; errorCode?: string }
+  }
   total: number
   reranked: boolean
   rerank?: RerankStatus
@@ -556,7 +563,15 @@ export class KnowledgeApi {
     return this.call('POST', `/import-directory/${encodeURIComponent(jobId)}/cancel`)
   }
 
-  getIndexingStatus(): Promise<Array<{ docId: string; baseId: string; title: string; phase: 'parsing' | 'embedding'; progress: number }>> {
+  getIndexingStatus(): Promise<Array<{
+    docId: string
+    baseId: string
+    title: string
+    phase: 'parsing' | 'embedding'
+    progress: number
+    status?: 'running' | 'failed'
+    error?: { code: string; message: string }
+  }>> {
     return this.call('GET', '/indexing-status')
   }
 
