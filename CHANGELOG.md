@@ -1,5 +1,30 @@
 # Changelog
 
+## 4.0.0 — 2026-09-15
+
+### One directory source, one sync path (issue #20)
+
+- **Idempotent re-import**: a directory source is now identified by its base plus its canonical real path. Importing the same directory again synchronizes the original tree in place instead of creating a second root. Manual directories with no live source keep their previous organizational meaning, and the base-wide background reindex no longer skips tracked roots.
+- **Truthful sync results**: every import and directory reindex returns per-item `created` / `updated` / `unchanged` / `deleted` / `failed` outcomes with relative paths, and an aggregate `synced` / `unchanged` / `partial` status. Unchanged files are never reported as failures, and a sync that succeeds for most files while some fail returns `partial` with the successful work retained.
+- **Path-based identity**: directory children are matched by their actual source path. A legacy child with no stored path is adopted only when its name and kind are unique; two candidates are reported as `ambiguous_source` rather than resolved by a first-match guess. A tree that the old behaviour already duplicated is never merged, moved, or auto-deleted — the user inspects and removes it.
+- **Live reindex identity**: files imported from a directory retain `sourcePath`, so a single-file reindex re-reads the file from disk instead of replaying the stored snapshot. `sourcePath` is exposed on administrative document summaries and details, and is never included in model-facing search results.
+
+### Explicit destructive deletes
+
+- **Delete impact preview**: `GET /knowledge/documents/:id/delete-impact` reports the directories, files, chunks, and durable raw snapshots a delete would remove, and whether an explicit confirmation is required.
+- **Recursive confirmation**: deleting a non-empty directory now fails with `recursive_confirmation_required` unless the caller passes `recursive: true`. The management panel fetches the impact first and shows a second confirmation listing the exact scope; the `knowledge_delete_document` tool exposes the same `recursive` argument. A batch delete preflights every selected root before any write, so a missing confirmation can never leave a partially deleted batch.
+
+### Local model lifecycle and retrieval status (issues #16–#18)
+
+- Isolated local embedding and rerank workers recover from a crashed or interrupted runtime instead of failing permanently.
+- Rerank readiness is finalized after normal inference, and retrieval reports the status of each lane so a degraded lane is visible rather than silent.
+
+### Compatibility and quality
+
+- The release is additive and migration-free: 0.3.9 data directories start without a database migration, re-embedding, forced reindex, legacy directory cleanup, or model download. Existing fields and call signatures keep working; the sync result, `sourcePath` accessor, delete-impact preview, and `recursive` argument are additions.
+- Installing and recovering a DSH profile is documented in both READMEs (issue #22).
+- Full typecheck, the complete Vitest suite, the deterministic build, package verification, production audit policy, and the retrieval benchmark are part of the release preflight; cross-platform CI and the real local embedding/rerank smoke run before the tag.
+
 ## 0.3.9 — 2026-09-02
 
 ### Local-path import and source tracking

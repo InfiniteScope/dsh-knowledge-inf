@@ -78,7 +78,7 @@ dsh plugin --profile <name> add dsh-knowledge
 
 ```bash
 # GitHub Release 或 npm pack 生成的 tarball
-dsh plugin --profile <name> add ./dsh-knowledge-0.3.9.tgz
+dsh plugin --profile <name> add ./dsh-knowledge-4.0.0.tgz
 
 # 本地源码目录，需要先完成构建
 dsh plugin --profile <name> add file:/path/to/dsh-knowledge
@@ -224,17 +224,18 @@ allowBuilds:
 
 ---
 
-## v0.3.9 更新重点
+## v4.0.0 更新重点
 
-- 支持通过绝对路径导入单个文件或完整目录树，并持续追踪顶层来源。
-- 来源重指严格限定到所选顶层文件或目录，跨扩展名时使用新文件对应的解析器。
-- 修复不同目录根下相同相对路径的 raw 缓存冲突，并为替换重建增加失败保护。
-- Ollama embedding 地址为空时回退到 `http://127.0.0.1:11434`；浏览或下载模型不再修改当前配置。
-- 改进主题 token、Popover 视口定位、关闭行为、Toast 交互和中英文本地化。
+- 目录来源以“知识库 + 规范化真实路径”确定身份：再次导入同一目录会原地同步原树，不再新建第二棵树。
+- 首次导入、重复导入、单文件重建和整库后台重建统一走同一套同步引擎，逐项返回新建 / 更新 / 未变化 / 删除 / 失败。未变化不再算失败，部分失败返回 `partial` 并保留已完成的同步。
+- 目录中的文件按“目录来源 + 相对路径”确定身份；历史遗留的重复树报告 `ambiguous_source`，不猜测、不合并、不自动删除。
+- 单文件重建会重新读取磁盘而不是重放旧快照；`sourcePath` 对管理 API 只读暴露，且不会出现在模型可见的检索结果中。
+- 删除非空目录必须显式 `recursive` 确认，并提供 `delete-impact` 预检，列出将被删除的目录、文件、分块和原始快照。
+- 合并 #16–#18 的本地模型生命周期与检索状态修复，并补充 #22 的配置文件安装恢复文档。
 
-本次升级不迁移数据库、不自动重建索引、不重新下载模型，也不改变 v0.3.8 的检索证据链契约。社区 PR #10–#13 的 ThinkForge-core 原作者提交和署名保留在 Git 历史中。
+本次升级不迁移数据库、不自动重建索引、不清理历史目录、不重新下载模型，也不改变既有字段与调用签名；新增的同步结果、`sourcePath`、删除影响预检与 `recursive` 参数均为加法接口。唯一收紧的是：非空目录不再允许被静默级联删除。
 
-[查看 v0.3.9 GitHub Release](https://github.com/Soren-ABT/dsh-knowledge/releases/tag/v0.3.9) · [查看 CHANGELOG](./CHANGELOG.md)
+[查看 v4.0.0 GitHub Release](https://github.com/Soren-ABT/dsh-knowledge/releases/tag/v4.0.0) · [查看 CHANGELOG](./CHANGELOG.md)
 
 ---
 
