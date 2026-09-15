@@ -4,3 +4,8 @@ lib/
 *.tgz
 .DS_Store
 coverage/
+# Private evaluation sets are built from personal material and must never be
+# committed or published (see the 0.2.12 changelog entry). Only templates ship.
+eval/
+scripts/eval-*.json
+!scripts/eval-*.example.json

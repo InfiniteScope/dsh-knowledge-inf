@@ -87,6 +87,12 @@ async function main() {
       if (FORBIDDEN_PREFIXES.some(prefix => path.startsWith(prefix))) errors.push(`packed artifact exposes forbidden path ${path}`)
       if (FORBIDDEN_FILES.includes(path)) errors.push(`packed artifact exposes obsolete runtime ${path}`)
       if (path.endsWith('.tgz')) errors.push(`packed artifact contains nested tarball ${path}`)
+      // A real evaluation set is built from private study material, so only the
+      // templates may ship. Keeping one in `scripts/` (which is in `files`) was a
+      // repeatable privacy regression — see the 0.2.12 changelog entry.
+      if (/^scripts\/eval-.*\.json$/.test(path) && !path.endsWith('.example.json')) {
+        errors.push(`packed artifact exposes a non-example eval set ${path}`)
+      }
     }
     if (!files.has(`docs/releases/v${pkg.version}.md`)) errors.push(`packed artifact is missing docs/releases/v${pkg.version}.md`)
   } finally {

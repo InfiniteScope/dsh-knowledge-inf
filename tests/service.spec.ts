@@ -1012,6 +1012,25 @@ describe('KnowledgeService', () => {
       .rejects.toThrow(/host not allowed/)
     await expect(service.addUrlDocument({ baseId: base.id, url: 'http://192.168.1.1/status' }))
       .rejects.toThrow(/host not allowed/)
+    // IPv6 loopback, unspecified and private/link-local ranges. These used to
+    // pass: the deny-list held BRACKETED literals while the lookup stripped the
+    // brackets first, so every IPv6 host bypassed the guard.
+    for (const url of [
+      'http://[::1]:8080/secret',
+      'http://[::]/',
+      'http://[fd00::1]/internal',
+      'http://[fe80::1]/internal',
+      'http://[::ffff:127.0.0.1]:11434/api/tags',
+      'http://[::ffff:7f00:1]/x',
+      'http://[ff02::1]/x',
+    ]) {
+      await expect(service.addUrlDocument({ baseId: base.id, url })).rejects.toThrow(/host not allowed/)
+    }
+    // CGNAT and benchmarking ranges are not legitimate targets either.
+    await expect(service.addUrlDocument({ baseId: base.id, url: 'http://100.64.0.1/' }))
+      .rejects.toThrow(/host not allowed/)
+    await expect(service.addUrlDocument({ baseId: base.id, url: 'http://198.18.0.1/' }))
+      .rejects.toThrow(/host not allowed/)
     await expect(service.addUrlDocument({ baseId: base.id, url: 'file:///etc/passwd' }))
       .rejects.toThrow(/protocol not allowed/)
     await expect(service.addUrlDocument({ baseId: base.id, url: 'ftp://example.com/file' }))
