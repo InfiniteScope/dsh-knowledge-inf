@@ -711,10 +711,6 @@ export async function ocrPdfText(bytes: Uint8Array): Promise<string> {
         await recognize(image.page, png)
       }
     }
-    return [...pageTexts.entries()]
-      .sort((a, b) => a[0] - b[0])
-      .map(([, texts]) => texts.join('\n'))
-      .join('\n\n')
   } catch (error) {
     // A rendering or extraction failure aborts the pass; record it so the
     // decision below can tell an engine failure from an empty document.

@@ -59,10 +59,12 @@
     "README.md",
     "README.en.md",
     "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE",
     "docs/releases",
     "benchmarks",
-    "scripts"
+    "scripts",
+    "pnpm-workspace.yaml"
   ],
   "scripts": {
     "build": "node build.mjs",
@@ -78,6 +80,7 @@
     "verify:package": "node scripts/verify-package.mjs",
     "verify:release": "node scripts/verify-release.mjs",
     "smoke:packed": "node scripts/smoke-packed-install.mjs",
+    "smoke:workers": "npm run build --silent && node scripts/smoke-worker-protocol.mjs",
     "smoke:local-embedding": "npm run build --silent && node scripts/smoke-local-embedding.mjs",
     "smoke:local-rerank": "npm run build --silent && node scripts/smoke-local-rerank.mjs",
     "release:check": "node scripts/release-check.mjs",

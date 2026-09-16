@@ -1,10 +1,15 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { deflateSync } from 'node:zlib'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { parseDocumentBuffer } from '../src/knowledge/parse.js'
+import { setLocalModelCacheDir } from '../src/knowledge/embed.js'
 import {
   buildOcrUrl,
   DEFAULT_OCR_MIRROR,
   extractPdfImages,
+  isOcrReady,
   normalizeRgba,
   ocrPdfText,
   postprocessOcrText,
@@ -108,9 +113,48 @@ describe('rgbaToPng', () => {
 
 describe('local OCR fallback', () => {
   it('returns empty when the OCR models are not downloaded (caller keeps its error)', async () => {
-    // The test environment has no traineddata on disk, so this is the gate path.
-    const text = await ocrPdfText(makeScannedPdf(8, 4, 4))
-    expect(text).toBe('')
+    // Point the cache at an EMPTY directory so this asserts the gate rather than
+    // whatever happens to be installed on the machine running the suite: the same
+    // '' used to be produced both by this gate and by a missing worker swallowing
+    // its own failure, so the test passed for the wrong reason wherever the real
+    // models were already downloaded.
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-ocr-gate-'))
+    vi.stubEnv('DSH_HOME', dir)
+    setLocalModelCacheDir(dir)
+    try {
+      const text = await ocrPdfText(makeScannedPdf(8, 4, 4))
+      expect(text).toBe('')
+    } finally {
+      setLocalModelCacheDir(undefined)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('reports an engine failure instead of claiming the document has no text', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-ocr-engine-'))
+    const ocrDir = join(dir, 'ocr')
+    await mkdir(ocrDir, { recursive: true })
+    // PaddleOCR's files exist, so the readiness gate passes and the OCR path is
+    // really taken. The worker, however, exists only as a build artifact — never
+    // beside src/ — so every page fails.
+    for (const name of ['ppocrv5_det.onnx', 'ppocrv5_rec.onnx', 'ppocrv5_dict.txt']) {
+      await writeFile(join(ocrDir, name), 'x')
+    }
+    vi.stubEnv('DSH_HOME', dir)
+    setLocalModelCacheDir(dir)
+    try {
+      // The setup itself must hold, or this test would silently assert the gate.
+      expect(isOcrReady()).toBe(true)
+      // Models installed + engine broken is an ENGINE failure. It used to return ''
+      // like an empty document, and the caller then told the user to download the
+      // models they already had (issue #17). The page must be big enough to be
+      // rendered (a degenerate 4x4 page falls back to raster extraction, which
+      // finds nothing and therefore attempts no recognition at all).
+      await expect(ocrPdfText(makeScannedPdf(8, 20, 20))).rejects.toThrow(/OCR could not process this document/)
+    } finally {
+      setLocalModelCacheDir(undefined)
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('a scanned PDF without OCR models still fails with the clear error', async () => {

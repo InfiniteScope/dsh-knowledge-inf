@@ -1172,8 +1172,12 @@ describe('local-path import source tracking', () => {
         // than skipping every directory container.
         await writeFile(alpha, 'alpha background reindex', 'utf8')
         const started = await service.startReindexBase(base.id)
+        // Wall-clock deadline rather than a fixed iteration budget: this waits on
+        // a real background job, and a contended runner can need far more
+        // event-loop turns than any small constant allows.
         let status = service.reindexJobStatus(started.jobId)
-        for (let index = 0; index < 100 && (status === undefined || !status.done); index += 1) {
+        const deadline = process.hrtime.bigint() + 10_000_000_000n
+        while ((status === undefined || !status.done) && process.hrtime.bigint() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 10))
           status = service.reindexJobStatus(started.jobId)
         }

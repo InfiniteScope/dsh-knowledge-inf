@@ -32,6 +32,8 @@ try {
   run('npm', ['run', 'benchmark'])
   run('npm', ['run', 'build'])
   run('npm', ['run', 'verify:package'])
+  // Bundles must not merely be present in the tarball: they must load and answer.
+  run('node', ['scripts/smoke-worker-protocol.mjs'])
   const status = spawnSync(executable('git'), ['status', '--porcelain'], { encoding: 'utf8' })
   if (status.error !== undefined) throw status.error
   if (status.status !== 0) throw new Error('git status failed')

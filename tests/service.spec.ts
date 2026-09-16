@@ -266,9 +266,13 @@ describe('KnowledgeService', () => {
     const started = await service.startReindexBase(base.id)
     expect(started.total).toBe(3)
 
-    // Poll the job until it settles (fast with the lexical-only provider).
+    // Poll the job until it settles (fast with the lexical-only provider). A
+    // wall-clock deadline, not a fixed iteration count: a contended runner needs
+    // more event-loop turns than any small constant allows, and this is the
+    // pattern that already caused one intermittent CI failure.
     let status = service.reindexJobStatus(started.jobId)
-    for (let i = 0; i < 50 && (status === undefined || !status.done); i += 1) {
+    const deadline = process.hrtime.bigint() + 10_000_000_000n
+    while ((status === undefined || !status.done) && process.hrtime.bigint() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 10))
       status = service.reindexJobStatus(started.jobId)
     }
