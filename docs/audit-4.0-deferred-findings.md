@@ -21,8 +21,8 @@ re-inspection.
   `validating`, gate refusal reported as `skipped`, cold-load allowance). What is
   *not* verified is the reporter's specific claim that a directory reindex is what
   leaves the gate armed; confirming it needs a real local reranker and a corpus of
-  the size they used (267 documents / 8,995 chunks). The reporter was asked to
-  confirm on their machine — see `issue-18-resolution.md`.
+  the size they used (267 documents / 8,995 chunks). The response to #18 asks them to
+  confirm it on their machine.
 - **`Module did not self-register` is process-local.** The fix depends on this: a
   failed `load`/`embed` now replaces the child, so the retry is a fresh process.
   The reporter verified a clean `node -e require(...)` loads the same addon, which

@@ -232,8 +232,10 @@ before the existing manual publish flow.
 
 ## Issue #5 Reply Draft
 
-Add `docs/issues/issue-5-resolution.md`, written as a concise maintainer reply
-that can be pasted without editing. It states that 0.3.5 fixed the issue by
+Add a reply draft for issue #5, written as a concise maintainer reply
+that can be pasted without editing. (It was committed under `docs/issues/` at the
+time; that directory is git-ignored now, so a reply draft is a local working file
+and not part of the repository.) It states that 0.3.5 fixed the issue by
 keeping the worker alive while disposing its ONNX sessions, serialized release
 and reload operations, corrected misleading error classification, and added
 regression coverage. It reports the real Qwen3 release/reload validation and

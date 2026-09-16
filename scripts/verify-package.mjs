@@ -29,7 +29,11 @@ const REQUIRED_FILES = [
   'lib/tool-knowledge/index.js',
   'lib/client.js',
 ]
-const FORBIDDEN_PREFIXES = ['src/', 'tests/', 'node_modules/', '.git/', '.github/', 'docs/superpowers/']
+// `docs/issues/` and `docs/images/` are working notes and retired local assets:
+// the first is git-ignored, the second is unreferenced, and neither has any
+// reason to reach a consumer. Listing them here means a later change to the
+// `files` allowlist cannot publish them by accident.
+const FORBIDDEN_PREFIXES = ['src/', 'tests/', 'node_modules/', '.git/', '.github/', 'docs/superpowers/', 'docs/issues/', 'docs/images/']
 const FORBIDDEN_FILES = ['lib/knowledge/embed-worker.mjs', 'lib/knowledge/embed-worker.mjs.map']
 
 function executable(name) {
