@@ -632,11 +632,15 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
         await api.addTextDocument(selectedBaseId, title, content, currentDirectoryId ?? undefined)
         setDialog(null)
         notify('success', `${t('tabText')}: ${title}`)
+        // Every sibling import path reloads; without this the note was created
+        // but invisible in the table (nothing else refreshes while idle), so the
+        // user's natural reaction was to add it a second time.
+        await reloadDocuments()
       } catch (err) {
         notify('error', err instanceof Error ? err.message : String(err))
       }
     })
-  }, [api, run, notify, selectedBaseId, currentDirectoryId, t])
+  }, [api, run, notify, reloadDocuments, selectedBaseId, currentDirectoryId, t])
 
   // Cherry Studio parity: every picked file becomes a row immediately (parsing
   // status) and the per-base worker pool processes them in the background; the
@@ -648,6 +652,14 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
   const [pendingConflict, setPendingConflict] = useState<{ files: File[]; conflicts?: string[] } | null>(null)
   /** Conflict resolution in flight — buttons show loading and the dialog cannot be closed mid-resolution. */
   const [pendingResolution, setPendingResolution] = useState<'rename' | 'replace' | null>(null)
+
+  /** Somewhere to land a rejected file import. Both entry points invoke the
+   *  runner with a bare `void`, and its detect/submit rounds sit outside the
+   *  per-file try, so a rejected batch (host down, unsupported type, offline)
+   *  used to produce NO feedback at all plus an unhandled rejection. */
+  const reportImportFailure = useCallback((err: unknown): void => {
+    notify('error', err instanceof Error ? err.message : String(err))
+  }, [notify])
 
   const runFileImport = useCallback(async (files: File[], conflict?: 'rename' | 'replace'): Promise<void> => {
     if (selectedBaseId === null || files.length === 0) return
@@ -736,7 +748,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
     setPendingConflict(null)
     if (resolution !== 'cancel') {
       setPendingResolution(resolution)
-      void runFileImport(files, resolution).finally(() => setPendingResolution(null))
+      void runFileImport(files, resolution).finally(() => setPendingResolution(null)).catch(reportImportFailure)
     }
   }, [pendingConflict, pendingResolution, runFileImport])
 
@@ -786,7 +798,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
     if (supported.length < files.length) {
       notify('warning', t('unsupportedFilesSkipped').replace('{count}', String(files.length - supported.length)))
     }
-    void runFileImport(supported)
+    void runFileImport(supported).catch(reportImportFailure)
   }, [runFileImport, notify, t])
 
   const runDirectoryImport = useCallback(async (files: File[]): Promise<void> => {
@@ -866,7 +878,9 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
       notify('error', err instanceof Error ? err.message : String(err))
     }
     await reloadDocuments()
-    notify('success', `${submitted} ${t('uploaded')}`)
+    // Only claim success for work that happened: the toast used to fire outside
+    // the try, so a failed directory import showed the error AND "0 uploaded".
+    if (submitted > 0) notify('success', `${submitted} ${t('uploaded')}`)
     if (skippedCount > 0) notify('info', t('skippedFiles').replace('{count}', String(skippedCount)))
   }, [api, notify, reloadDocuments, selectedBaseId, t])
 
@@ -1855,6 +1869,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
           label={t('groupName')}
           initial=""
           onOk={(value) => void createGroup(value, dialog.forBaseId)}
+          busy={busy}
           onClose={() => setDialog(null)}
         />
       )}
@@ -1864,6 +1879,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
           label={t('groupName')}
           initial={dialog.group}
           onOk={(value) => void renameGroup(dialog.group, value)}
+          busy={busy}
           onClose={() => setDialog(null)}
         />
       )}
@@ -1883,6 +1899,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
           label={t('baseName')}
           initial={dialog.base.name}
           onOk={(value) => void renameBase(dialog.base, value)}
+          busy={busy}
           onClose={() => setDialog(null)}
         />
       )}
@@ -1953,6 +1970,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
           label={t('urlDesc')}
           initial=""
           onOk={(value) => { setDialog(null); addUrl(value) }}
+          busy={busy}
           onClose={() => setDialog(null)}
         />
       )}
@@ -1962,6 +1980,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
           label={t('pathDesc')}
           initial=""
           onOk={(value) => { setDialog(null); addPath(value) }}
+          busy={busy}
           onClose={() => setDialog(null)}
         />
       )}
@@ -1971,6 +1990,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
           label={t('sourcePathPrompt')}
           initial={dialog.initial}
           onOk={(value) => { setDialog(null); editSourcePath(dialog.sourceId, value) }}
+          busy={busy}
           onClose={() => setDialog(null)}
         />
       )}
@@ -2029,6 +2049,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
           label={t('baseName')}
           initial={dialog.doc.title}
           onOk={(value) => void renameDocument(dialog.doc, value)}
+          busy={busy}
           onClose={() => setDialog(null)}
         />
       )}
@@ -2049,7 +2070,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
             notify('warning', t('tooManyFiles').replace('{count}', String(MAX_FILES)))
             return
           }
-          void runFileImport(picked)
+          void runFileImport(picked).catch(reportImportFailure)
         }}
       />
       <input

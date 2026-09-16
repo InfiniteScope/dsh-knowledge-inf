@@ -5,7 +5,7 @@
  * @module dsh-knowledge/client/dialogs
  */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { SearchMode } from './api.js'
 import { C, style } from './theme.js'
@@ -98,11 +98,20 @@ export function PromptDialog(props: {
   title: string
   label: string
   initial: string
+  /** The parent's in-flight flag. When it falls back to false the action has
+   *  settled, so the submit latch below is released: parents keep this dialog
+   *  mounted on FAILURE (they only close it on success), and without this the OK
+   *  button stayed disabled forever after one failed rename/create, forcing the
+   *  user to close the dialog and retype everything. */
+  busy?: boolean
   onOk: (value: string) => void
   onClose: () => void
 }): JSX.Element {
   const [value, setValue] = useState(props.initial)
   const [submitting, setSubmitting] = useState(false)
+  useEffect(() => {
+    if (props.busy !== true) setSubmitting(false)
+  }, [props.busy])
   const submit = (): void => {
     if (submitting || value.trim().length === 0) return
     // Debounce repeat Enter/click: the parent closes the dialog on success,

@@ -29,6 +29,12 @@ export function LocalModelsSection(props: LocalModelsSectionProps): JSX.Element 
   const { api, t } = props
   const [models, setModels] = useState<LocalModelSummary[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /** Success/info line from the last action. Kept apart from `error` so the two
+   *  cannot overwrite each other, and rendered with success styling instead of
+   *  the red error banner. */
+  const [notice, setNotice] = useState<string | null>(null)
+  /** Failure reported by the 1s background poll — the only slot it may clear. */
+  const [pollError, setPollError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [customRerankerId, setCustomRerankerId] = useState('')
   const [customRerankerAccepted, setCustomRerankerAccepted] = useState(false)
@@ -56,9 +62,13 @@ export function LocalModelsSection(props: LocalModelsSectionProps): JSX.Element 
       const [next, ocr] = await Promise.all([api.listLocalModels(), api.getOcrStatus()])
       setModels(next)
       setOcrStatus(ocr)
-      setError(null)
+      // The poll clears only ITS OWN failure slot. Clearing the shared error slot
+      // here erased every action's message within a second (the poll runs every
+      // second, and several actions call refresh() in their own finally), so a
+      // failed download looked like it had silently succeeded.
+      setPollError(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setPollError(err instanceof Error ? err.message : String(err))
     }
   }, [api])
 
@@ -100,13 +110,14 @@ export function LocalModelsSection(props: LocalModelsSectionProps): JSX.Element 
 
   const saveCacheDir = useCallback(async (): Promise<void> => {
     setError(null)
+    setNotice(null)
     try {
       await api.setConfig({ localModelCacheDir: cacheDir.trim() })
       setCacheDir(cacheDir.trim())
       // Saving only points the config at the new directory; the files stay
       // where they are. Say so explicitly — a silent save read as "no
       // reaction" and left users believing the models had moved.
-      setError(t('cacheDirSaved'))
+      setNotice(t('cacheDirSaved'))
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
@@ -124,8 +135,9 @@ export function LocalModelsSection(props: LocalModelsSectionProps): JSX.Element 
 
   const browseCacheDir = useCallback(async (): Promise<void> => {
     setError(null)
+    setNotice(null)
     if (props.workspaces === undefined) {
-      setError(t('cacheDirPickUnavailable'))
+      setNotice(t('cacheDirPickUnavailable'))
       return
     }
     try {
@@ -150,16 +162,16 @@ export function LocalModelsSection(props: LocalModelsSectionProps): JSX.Element 
   const migrateCacheDir = useCallback(async (): Promise<void> => {
     setMigrating(true)
     setError(null)
+    setNotice(null)
     try {
       const result = await api.migrateLocalModels(cacheDir.trim())
       setCacheDir(result.to)
-      setError(null)
       if (result.moved > 0) {
-        setError(t('cacheDirMigrated').replace('{count}', String(result.moved)).replace('{to}', result.to))
+        setNotice(t('cacheDirMigrated').replace('{count}', String(result.moved)).replace('{to}', result.to))
       } else {
         // Also silent before: a no-op migration (same dir, or the target
         // already holds the entries) showed nothing at all.
-        setError(t('cacheDirMigrateNone'))
+        setNotice(t('cacheDirMigrateNone'))
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -437,7 +449,15 @@ export function LocalModelsSection(props: LocalModelsSectionProps): JSX.Element 
         </div>
       )}
 
+      {notice !== null && (
+        <div style={{ ...style.error, color: C.success, background: 'color-mix(in srgb, var(--dsw-alias-state-success-primary, #30a46c) 10%, transparent)', marginBottom: 12 }}>{notice}</div>
+      )}
+
       {error !== null && <div style={{ ...style.error, marginBottom: 12 }}>{error}</div>}
+
+      {pollError !== null && (
+        <div style={{ ...style.error, marginBottom: 12 }}>{t('statusPollFailed')}: {pollError}</div>
+      )}
 
       <div style={{ marginBottom: 14, padding: 12, border: `1px solid ${C.border}`, borderRadius: 12, background: C.surface }}>
         <label style={{ display: 'block', fontSize: 12, fontWeight: 600, marginBottom: 5 }}>{t('customRerankTitle')}</label>
@@ -718,7 +738,7 @@ function ModelCard(props: {
             {model.subtitle}
           </p>
           {model.kind === 'reranking' && model.lastCheckedAt !== undefined && (
-            <p style={{ marginTop: 3, fontSize: 11, color: C.muted }}>最近验证：{new Date(model.lastCheckedAt).toLocaleString()} · {model.latencyMs ?? 0}ms</p>
+            <p style={{ marginTop: 3, fontSize: 11, color: C.muted }}>{t('rerankLastValidated')}{new Date(model.lastCheckedAt).toLocaleString()} · {model.latencyMs ?? 0}ms</p>
           )}
         </div>
         {ready && <div style={{ display: 'flex', gap: 4 }}>
