@@ -1,6 +1,6 @@
 {
   "topK": 5,
-  "_comment": "Copy this file to scripts/eval-questions.json and replace with real questions. expect entries are document-title substrings (e.g. '排队论' matches 排队论.pdf).",
+  "_comment": "Copy this file to eval/eval-questions.json (that directory is git-ignored and never published) and replace with real questions. Do NOT put a real set in scripts/: that directory ships in the npm package. expect entries are document-title substrings (e.g. '排队论' matches 排队论.pdf).",
   "questions": [
     {
       "query": "偏微分方程的数值解法有哪些",

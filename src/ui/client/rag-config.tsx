@@ -155,12 +155,42 @@ export function RagConfigPanel(props: PanelProps): JSX.Element {
 
   const patch = (p: Partial<KnowledgeConfig>): void => setValues(prev => ({ ...prev, ...p }))
 
-  // Number inputs: an emptied field yields NaN, which must not reach the
-  // config (the durable schema would reject the save). Ignore non-finite
-  // values — the controlled input snaps back to the last valid number.
+  // Number inputs. Two traps, both of which used to reach the durable schema and
+  // come back as an opaque validation error on save:
+  //  - an emptied field is `Number('') === 0`, which is FINITE, so the old guard
+  //    accepted it — and 0 fails `int().gt(0)` for chunkSize/topK/…;
+  //  - a hand-typed value outside the field's range (topK 0, weight 9, a
+  //    fractional chunk size) was stored as typed.
+  // Blank now means "no change" (the controlled input snaps back) and a value
+  // outside the documented range is clamped to it rather than saved.
+  const NUMBER_RANGES: Partial<Record<keyof KnowledgeConfig, { min: number; max?: number; int?: boolean }>> = {
+    chunkSize: { min: 1, int: true },
+    chunkOverlap: { min: 0, int: true },
+    topK: { min: 1, int: true },
+    embeddingBatchSize: { min: 1, int: true },
+    siblingChunks: { min: 0, max: 3, int: true },
+    chunkTokenLimit: { min: 0, int: true },
+    urlRefreshHours: { min: 0, int: true },
+    autoRetrieveWeight: { min: 0, max: 5, int: true },
+    similarityThreshold: { min: 0, max: 1 },
+    mmrDiversity: { min: 0, max: 1 },
+    rrfVectorWeight: { min: 0.1, max: 5 },
+    semanticChunkThreshold: { min: 0, max: 1 },
+    localRerankTimeoutMs: { min: 10_000, max: 300_000, int: true },
+    localWorkerIdleTimeoutMs: { min: 0, int: true },
+  }
+
   const patchNumber = (key: keyof KnowledgeConfig, raw: string): void => {
-    const n = Number(raw)
-    if (Number.isFinite(n)) patch({ [key]: n } as Partial<KnowledgeConfig>)
+    if (raw.trim() === '') return
+    let n = Number(raw)
+    if (!Number.isFinite(n)) return
+    const range = NUMBER_RANGES[key]
+    if (range !== undefined) {
+      if (range.int === true) n = Math.trunc(n)
+      if (n < range.min) n = range.min
+      if (range.max !== undefined && n > range.max) n = range.max
+    }
+    patch({ [key]: n } as Partial<KnowledgeConfig>)
   }
 
   const save = async (): Promise<void> => {

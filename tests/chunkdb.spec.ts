@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { ChunkDatabase } from '../src/knowledge/chunkdb.js'
 
 const open = (): ChunkDatabase => new ChunkDatabase(':memory:')
@@ -107,5 +111,45 @@ describe('ChunkDatabase vector lane', () => {
     ])
     await expect(db.vector([1, 0], ['b1'], 20, [])).resolves.toEqual({ total: 0, hits: [] })
     db.close()
+  })
+})
+
+describe('ChunkDatabase FTS migration recovery', () => {
+  it('rebuilds the trigram index when a previous migration was interrupted', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kb-fts-'))
+    const path = join(dir, 'chunks.sqlite')
+    let db: ChunkDatabase | undefined
+    let reopened: ChunkDatabase | undefined
+    try {
+      db = new ChunkDatabase(path)
+      db.putChunks([{ id: 'c1', docId: 'd1', baseId: 'b1', index: 0, text: 'half applied rebuild' }])
+      expect((await db.lexical('half applied', ['b1'], 20)).hits.map(hit => hit.id)).toContain('c1')
+      db.close()
+      db = undefined
+
+      // Reproduce an interrupted upgrade exactly: the FTS table exists with the
+      // shape the old textual guard accepted and holds no rows, and no migration
+      // marker was written. That is the state whose rebuild the old code skipped
+      // forever, leaving the whole lexical lane silently empty.
+      const raw = new DatabaseSync(path)
+      raw.exec('DROP TRIGGER IF EXISTS chunk_ai')
+      raw.exec('DROP TRIGGER IF EXISTS chunk_ad')
+      raw.exec('DROP TRIGGER IF EXISTS chunk_au')
+      raw.exec('DROP TABLE IF EXISTS chunk_fts')
+      raw.exec(`CREATE VIRTUAL TABLE chunk_fts USING fts5(
+        search_text, content='chunk', content_rowid='fts_rowid', tokenize='trigram'
+      )`)
+      raw.exec(`DELETE FROM chunk_meta WHERE key = 'fts_rowid_migrated'`)
+      raw.close()
+
+      // Reopening must notice the migration never completed and rebuild.
+      reopened = new ChunkDatabase(path)
+      const hits = await reopened.lexical('half applied', ['b1'], 20)
+      expect(hits.hits.map(hit => hit.id)).toContain('c1')
+    } finally {
+      try { db?.close() } catch { /* already closed */ }
+      try { reopened?.close() } catch { /* already closed */ }
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

@@ -329,6 +329,14 @@ export type KnowledgeKey =
   | 'cascadeImpactChunks'
   | 'cascadeImpactSnapshots'
   | 'cascadeDeleteConfirm'
+  | 'syncCreated'
+  | 'syncUpdated'
+  | 'syncDeleted'
+  | 'syncUnchanged'
+  | 'syncFailed'
+  | 'syncNoChanges'
+  | 'statusPollFailed'
+  | 'rerankLastValidated'
   | 'error'
 
 /** Bound translate over the knowledge dictionary. */
@@ -612,6 +620,14 @@ export const zh: Record<KnowledgeKey, string> = {
   cascadeImpactChunks: '分块',
   cascadeImpactSnapshots: '原始快照',
   cascadeDeleteConfirm: '级联删除',
+  syncCreated: '新建',
+  syncUpdated: '更新',
+  syncDeleted: '删除',
+  syncUnchanged: '未变化',
+  syncFailed: '失败',
+  syncNoChanges: '未检测到变化',
+  statusPollFailed: '状态刷新失败',
+  rerankLastValidated: '最近验证：',
   noLocalModels: '暂无本地模型',
   lexicalOnly: '仅关键词',
   lexicalOnlyHint: '未配置向量化模型，当前仅关键词检索。点右上角「设置」配置嵌入模型可启用语义检索',
@@ -940,6 +956,14 @@ export const en: Record<KnowledgeKey, string> = {
   cascadeImpactChunks: 'Chunks',
   cascadeImpactSnapshots: 'Raw snapshots',
   cascadeDeleteConfirm: 'Delete subtree',
+  syncCreated: 'Created',
+  syncUpdated: 'Updated',
+  syncDeleted: 'Deleted',
+  syncUnchanged: 'Unchanged',
+  syncFailed: 'Failed',
+  syncNoChanges: 'No changes detected',
+  statusPollFailed: 'Status refresh failed',
+  rerankLastValidated: 'Last validated: ',
   noLocalModels: 'No local models yet',
   lexicalOnly: 'Lexical only',
   lexicalOnlyHint: 'No embedding model configured — search is lexical only. Use the Settings button (top right) to configure an embedding model and enable semantic retrieval.',

@@ -10,6 +10,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import { createHash } from 'node:crypto'
 import { cp, mkdir, readdir, readFile, realpath, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { isIP } from 'node:net'
 import { chunkText, mergeSemanticSegments, refineChunksByTokenLimit, splitSemanticSegments } from './chunk.js'
 import type { ChunkPiece } from './chunk.js'
 import { composeContextWindow, estimateContextTokens, serializeContextWindow } from './context.js'
@@ -24,6 +25,7 @@ import {
   hasActiveLocalModelDownload,
   isLocalModelDownloaded,
   localModelCacheDir,
+  markLocalModelError,
   setHfEndpoint,
   setLocalModelCacheDir,
   setLocalWorkerIdleTimeoutMs,
@@ -31,7 +33,7 @@ import {
 import type { LocalModelStatus } from './embed.js'
 import { cancelLocalModelDownload, deleteLocalModel, downloadLocalModel, hasActiveLocalRerankDownload, listLocalModels, LOCAL_MODELS, registerCustomLocalReranker, selfTestLocalModel } from './localModels.js'
 import type { LocalModelSummary } from './localModels.js'
-import { disposeLocalRerankProcess, setLocalRerankIdleTimeoutMs } from './local-rerank.js'
+import { disposeLocalRerankProcess, localRerankChildIsWarm, setLocalRerankIdleTimeoutMs } from './local-rerank.js'
 import { downloadOcrModels, disposeOcrWorker, getOcrModelStatus, removeOcrModels, type OcrModelStatus } from './ocr.js'
 import { httpFetch } from './net.js'
 import { knowledgeRoute } from './http.js'
@@ -41,7 +43,7 @@ import { maximalMarginalRelevance, reciprocalRankFusion, RRF_K } from './retriev
 import type { RankedHit } from './retrieval.js'
 import { rerankCandidates, rerankErrorDetail, rerankTechnicalMessage } from './rerank.js'
 import { hashEmbeddingText } from './chunkdb.js'
-import { openStore } from './store.js'
+import { openStore, StorageUnavailableError } from './store.js'
 import type { StorageDomainFacility, Store } from './store.js'
 import {
   activeOllamaPulls as activeOllamaPullsHelper,
@@ -93,6 +95,7 @@ import type {
 
 export type * from './types.js'
 export { Config } from './config.js'
+export { openStore, StorageUnavailableError } from './store.js'
 export { knowledgeDomainSpec } from './domain.js'
 export { chunkText } from './chunk.js'
 export { composeContextWindow, estimateContextTokens, serializeContextWindow } from './context.js'
@@ -192,6 +195,13 @@ const CONCEPT_GREP_SNIPPET_PAD = 60
 const CONCEPT_GREP_MAX_LINE_CHARS = 2000
 /** How long a finished job's final progress stays visible (Cherry's linger TTL). */
 const PROGRESS_LINGER_TTL_MS = 60_000
+/** A terminal indexing FAILURE stays visible far longer than an in-progress
+ *  linger: the reported embedding failure expired after 60s, so a user who
+ *  looked a minute later saw the job simply vanish with no recorded error. */
+const FAILURE_LINGER_TTL_MS = 10 * 60_000
+/** Extra deadline granted to a COLD local rerank child so its model load is not
+ *  charged to the inference budget of the query that triggered it (issue #18). */
+const LOCAL_RERANK_LOAD_ALLOWANCE_MS = 120_000
 /** Embedding batch retry policy (Cherry's job retry contract). */
 const EMBED_MAX_ATTEMPTS = 3
 const EMBED_RETRY_BASE_DELAY_MS = 1000
@@ -243,6 +253,9 @@ export class KnowledgeService extends Service {
 
   private readonly baseConfig: Config
   private store: Store | undefined
+  /** Set when the durable backend exists but could not be opened, so every
+   *  store-backed call can report the real reason instead of an empty library. */
+  private storageError: Error | undefined
   private readonly storeReady: Promise<void>
   private resolveStore: () => void = () => {}
   private readonly jobs = new Map<string, BackgroundJob>()
@@ -276,9 +289,28 @@ export class KnowledgeService extends Service {
     setLocalModelCacheDir(this.baseConfig.localModelCacheDir)
     setHfEndpoint(this.baseConfig.hfEndpoint)
     const facility = this.ctx.get('storageDomain') as StorageDomainFacility | undefined
-    this.store = await openStore(facility, { chunkStorePath: this.baseConfig.chunkStorePath })
+    try {
+      this.store = await openStore(facility, { chunkStorePath: this.baseConfig.chunkStorePath })
+    } catch (error) {
+      // The durable backend exists but could not be opened or healed. Keep the
+      // plugin alive so the failure is visible and diagnosable, but never
+      // substitute an in-memory store: that would present an empty library
+      // while the data sits intact on disk, and discard every later write.
+      this.storageError = error instanceof Error ? error : new Error(String(error))
+      this.ctx.logger.error(`knowledge: ${this.storageError.message}`)
+    }
     this.resolveStore()
     const store = this.store
+    // Teardown is registered unconditionally: without a store the plugin still
+    // answers status/model calls, so a local model worker it started must not
+    // outlive it.
+    this.ctx.effect(() => async () => { await store?.close() }, 'knowledge: close store')
+    // Terminate the local-model inference worker on teardown so a loaded
+    // ~600MB model can never outlive the plugin (Cherry: lifecycle-managed worker).
+    this.ctx.effect(() => () => { void disposeLocalModelWorker() }, 'knowledge: dispose local model worker')
+    this.ctx.effect(() => () => { void disposeLocalRerankProcess() }, 'knowledge: dispose local rerank process')
+    this.ctx.effect(() => () => { void disposeOcrWorker() }, 'knowledge: dispose OCR worker')
+    if (store === undefined) return
     // Reapply the RUNTIME overrides persisted in the domain (they survive
     // restarts): without this, a saved localModelCacheDir / hfEndpoint was
     // only live after the next explicit save — model downloads/checks and the
@@ -303,12 +335,6 @@ export class KnowledgeService extends Service {
         if (model?.status === 'unhealthy' && model.health === 'unchecked') void selfTestLocalModel(modelId)
       }
     }).catch(() => {})
-    this.ctx.effect(() => async () => { await store.close() }, 'knowledge: close store')
-    // Terminate the local-model inference worker on teardown so a loaded
-    // ~600MB model can never outlive the plugin (Cherry: lifecycle-managed worker).
-    this.ctx.effect(() => () => { void disposeLocalModelWorker() }, 'knowledge: dispose local model worker')
-    this.ctx.effect(() => () => { void disposeLocalRerankProcess() }, 'knowledge: dispose local rerank process')
-    this.ctx.effect(() => () => { void disposeOcrWorker() }, 'knowledge: dispose OCR worker')
     // Resume documents a previous process left mid-embedding: their chunks are
     // partially persisted, so re-running the embed with hash reuse completes
     // them without re-embedding the batches that already landed. (openStore
@@ -324,7 +350,11 @@ export class KnowledgeService extends Service {
         for (const id of resumeIds) {
           const doc = store.getDocument(id)
           if (doc !== undefined) {
-            await store.putDocument({ ...doc, embeddingError: reason, errorCode: 'interrupted', updatedAt: Date.now() })
+            // Clear the resumable marker as part of the decision: leaving it set
+            // meant every later start re-marked the same document failed and
+            // overwrote its real embeddingError with `interrupted`, forever.
+            const { incomplete: _resumableMarker, ...rest } = doc
+            await store.putDocument({ ...rest, embeddingError: reason, errorCode: 'interrupted', updatedAt: Date.now() })
           }
         }
         this.ctx.logger.info(`knowledge: marked ${resumeIds.length} interrupted import(s) failed (auto-resume disabled)`)
@@ -619,7 +649,7 @@ export class KnowledgeService extends Service {
     await store.deleteBase(id)
     // A whole-base delete frees a large chunk of pages; hand them back to the
     // OS (threshold-gated, so a small base never pays for a VACUUM).
-    this.reclaimAfterDelete()
+    await this.reconcileAfterDelete()
     // Keep a selected id as a stale marker. If it was the last selected base,
     // enabledScope() must resolve to [] (fail closed), never broaden to all.
   }
@@ -961,7 +991,7 @@ export class KnowledgeService extends Service {
           phase: 'parsing',
           code: 'parse_failed',
           message: safeIndexingErrorMessage(message),
-          expireAt: Date.now() + PROGRESS_LINGER_TTL_MS,
+          expireAt: Date.now() + FAILURE_LINGER_TTL_MS,
         })
         try {
           await store.putDocument({ ...current, embeddingError: message, errorCode: 'parse_failed', updatedAt: Date.now() })
@@ -1144,10 +1174,13 @@ export class KnowledgeService extends Service {
       .filter(item => item.action === 'failed' && item.error !== undefined)
       .map(item => ({ file: item.relativePath, error: item.error!.message }))
     return {
-      // Keep the pre-4.0 fields stable: `imported` has always meant files,
-      // while `directories` includes the root on an initial import.
-      imported: sync.items.filter(item => item.kind === 'file' && item.action === 'created').length,
-      directories: sync.items.filter(item => item.kind === 'directory' && item.action === 'created').length,
+      // `imported`/`directories` keep their pre-4.0 meaning of "items this call
+      // wrote", i.e. created PLUS updated. Counting only `created` made a
+      // re-sync that re-parsed and re-embedded every changed file report
+      // `imported: 0` — success-shaped zeros for real work. The split lives in
+      // `sync` for callers that need it.
+      imported: sync.items.filter(item => item.kind === 'file' && (item.action === 'created' || item.action === 'updated')).length,
+      directories: sync.items.filter(item => item.kind === 'directory' && (item.action === 'created' || item.action === 'updated')).length,
       errors,
       sourceId: prepared.root.id,
       mode: prepared.mode,
@@ -1357,7 +1390,27 @@ export class KnowledgeService extends Service {
     }
     if (source.sourceType === 'directory') {
       if (!st.isDirectory()) throw new Error('a directory source must be repointed to a directory')
-      await store.putDocument({ ...source, sourcePath: await this.canonicalSourcePath(trimmed), updatedAt: Date.now() })
+      const canonical = await this.canonicalSourcePath(trimmed)
+      // Repointing must respect the same one-source-one-path invariant that
+      // prepareDirectoryImport enforces. Without this check a repoint onto a path
+      // another root already owns left TWO trees bound to one directory: the next
+      // import then fails closed with `ambiguous_source` for both, and a rescan of
+      // the repointed root matches no child by path, so every file is re-created
+      // and rejected as a duplicate — a `partial` sync whose items are all failed.
+      const conflict = store.listDocuments(baseId).find(document =>
+        document.id !== source.id
+        && document.sourceType === 'directory'
+        && document.sourcePath !== undefined
+        && this.sameSourcePath(document.sourcePath, canonical),
+      )
+      if (conflict !== undefined) {
+        throw new DirectorySourceError(
+          'source_path_conflict',
+          'another directory source in this knowledge base is already bound to that path',
+          { sourcePath: canonical, sourceId: conflict.id },
+        )
+      }
+      await store.putDocument({ ...source, sourcePath: canonical, updatedAt: Date.now() })
     } else {
       if (!st.isFile()) throw new Error('a file source must be repointed to a file')
       const nextFileName = basename(trimmed)
@@ -1495,6 +1548,21 @@ export class KnowledgeService extends Service {
     await this.deleteDocumentRecursive(id)
     // One updatedAt write per delete, not per descendant.
     await this.touchBase(existing.baseId)
+    await this.reconcileAfterDelete()
+  }
+
+  /** Post-delete cleanup: drop chunk rows whose document is already gone (a
+   *  batch that landed after the row was deleted keeps matching the retrieval
+   *  lanes, which scope by base rather than by document existence), then
+   *  reclaim space. */
+  private async reconcileAfterDelete(): Promise<void> {
+    const store = this.requireStore()
+    try {
+      const removed = await store.reconcileOrphanChunks()
+      if (removed > 0) this.ctx.logger.warn(`knowledge: removed chunks left by ${removed} deleted document(s)`)
+    } catch (error) {
+      this.ctx.logger.warn(`knowledge: orphan chunk reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
     this.reclaimAfterDelete()
   }
 
@@ -2038,25 +2106,58 @@ export class KnowledgeService extends Service {
     }
   }
 
-  async reindexBase(baseId: string): Promise<{ reindexed: number }> {
+  /** Reindex a whole base synchronously. Collects per-root failures instead of
+   *  aborting the sweep: one unreadable source (a moved folder, an unmounted
+   *  drive) must not stop the remaining documents, exactly as the background job
+   *  and the bulk endpoint already behave. */
+  async reindexBase(baseId: string): Promise<{ reindexed: number; skipped: number; failed: number; items: DirectorySyncItem[] }> {
     const store = this.requireStore()
+    if (store.getBase(baseId) === undefined) throw new Error(`knowledge base not found: ${baseId}`)
     const ids = store.listDocuments(baseId).map(doc => doc.id)
     // Fold to outermost roots: a directory reindexes its subtree recursively,
     // so its descendants must not be reindexed a second time as siblings.
     let reindexed = 0
+    let skipped = 0
+    let failed = 0
+    const items: DirectorySyncItem[] = []
     for (const id of this.outermostSelectedIds(ids)) {
       // In-flight documents are skipped (Cherry's REINDEX_ALLOWED_STATUSES),
       // never failed: a base reindex triggered while an import is running must
       // not abort the whole sweep because one row is busy.
-      if (this.indexing.has(id)) continue
-      await this.reindexDocument(id)
-      reindexed += 1
+      if (this.indexing.has(id)) {
+        skipped += 1
+        continue
+      }
+      try {
+        const result = await this.reindexDocument(id)
+        reindexed += 1
+        if (result.sync !== undefined) {
+          items.push(...result.sync.items)
+          failed += result.sync.failed
+        }
+      } catch (error) {
+        failed += 1
+        const document = store.getDocument(id)
+        items.push({
+          relativePath: document?.title ?? id,
+          kind: document?.sourceType === 'directory' ? 'directory' : 'file',
+          documentId: id,
+          action: 'failed',
+          error: this.directoryItemError(error),
+        })
+      }
     }
-    return { reindexed }
+    return { reindexed, skipped, failed, items }
   }
 
-  /** Start re-embedding a whole base as a cancellable background job. */
-  async startReindexBase(baseId: string): Promise<{ jobId: string; total: number }> {
+  /** Start re-embedding a whole base as a cancellable background job.
+   *
+   *  `total` counts the folded SOURCE ROOTS the job walks, which is the same unit
+   *  as `imported`, so `imported / total` stays meaningful. `documentTotal` is the
+   *  size of the base in documents, because a client that compares the job's
+   *  total with its document count would otherwise read one directory holding 200
+   *  files as a single unit of work. */
+  async startReindexBase(baseId: string): Promise<{ jobId: string; total: number; documentTotal: number }> {
     const store = this.requireStore()
     if (store.getBase(baseId) === undefined) throw new Error(`knowledge base not found: ${baseId}`)
     const documents = store.listDocuments(baseId)
@@ -2075,7 +2176,7 @@ export class KnowledgeService extends Service {
       done: false,
     })
     void this.runReindexJob(jobId, baseId)
-    return { jobId, total: roots.length }
+    return { jobId, total: roots.length, documentTotal: documents.length }
   }
 
   /** Progress snapshot of an active (or just-finished) reindex job. */
@@ -2158,25 +2259,38 @@ export class KnowledgeService extends Service {
     return { reindexed, skipped, failed, items }
   }
 
-  async deleteDocuments(ids: readonly string[], options?: { recursive?: boolean }): Promise<{ deleted: number }> {
+  /** Delete a selection (folded to its outermost roots).
+   *
+   *  `deleted` is the number of DOCUMENTS removed, including the descendants of
+   *  a selected directory — the meaning it had before 4.0 folded the selection.
+   *  Counting folded roots instead made the confirmation ("delete these N rows")
+   *  and the result ("deleted: 1" for a directory holding 200 files) describe the
+   *  same action with different numbers. `roots` carries the folded count. */
+  async deleteDocuments(ids: readonly string[], options?: { recursive?: boolean }): Promise<{ deleted: number; roots: number }> {
     const store = this.requireStore()
+    if (ids.length === 0) throw new Error('no documents selected')
     // Fold to outermost roots so a directory and its selected descendants are
     // not deleted twice. Preflight *all* roots before the first delete so a
     // missing recursive confirmation can never produce a partial batch write.
     const roots = this.assertDeleteImpacts(ids, options?.recursive === true)
     const touched = new Set<string>()
     let deleted = 0
+    let removedRoots = 0
     for (const id of roots) {
       const document = store.getDocument(id)
       if (document === undefined) continue
+      // The preflight already walked each subtree; reuse it so the reported count
+      // matches what the confirmation showed.
+      const impact = this.getDeleteImpact(id)
+      deleted += impact.directories + impact.files
       await this.deleteDocumentRecursive(id)
       touched.add(document.baseId)
-      deleted += 1
+      removedRoots += 1
     }
     // One updatedAt write per affected base, not per document.
     for (const baseId of touched) await this.touchBase(baseId)
-    this.reclaimAfterDelete()
-    return { deleted }
+    await this.reconcileAfterDelete()
+    return { deleted, roots: removedRoots }
   }
 
   /**
@@ -2992,7 +3106,7 @@ export class KnowledgeService extends Service {
         }
       }
       throwIfAborted(signal)
-      return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, total, startedAt, allowRerank, signal, laneStatus)
+      return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, total, startedAt, laneStatus, allowRerank, signal)
     }
 
     const chunks = (request.baseId !== undefined
@@ -3054,7 +3168,7 @@ export class KnowledgeService extends Service {
         returnedCount: ranked.filter(hit => hit.vectorScore !== undefined).length,
       },
     )
-    return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, chunks.length, startedAt, allowRerank, signal, retrieval)
+    return this.finishSearch(store, config, query, requestedMode, ranked, byId, topK, threshold, chunks.length, startedAt, retrieval, allowRerank, signal)
   }
 
   /** Merge independent query rankings with RRF, then optionally rerank once. */
@@ -3115,9 +3229,14 @@ export class KnowledgeService extends Service {
     threshold: number,
     total: number,
     startedAt: number,
+    // Required, and placed before the optional tail so the compiler enforces it:
+    // the status must come from the lanes that actually ran. The old row-derived
+    // default is gone because that inference IS the #16 defect — a search whose
+    // vector lane contributed reported `mode: "lexical"` whenever no single row
+    // happened to carry both scores.
+    retrieval: RetrievalStatus,
     allowRerank = true,
     signal?: AbortSignal,
-    retrieval = retrievalStatusFromRanked(requestedMode, initial),
   ): Promise<SearchResult> {
     throwIfAborted(signal)
     const ranked = initial
@@ -3189,7 +3308,15 @@ export class KnowledgeService extends Service {
     )
     const candidateCount = contextual.length
     const rerankStartedAt = Date.now()
-    const rerankTimeoutMs = rerankModel.startsWith('local:') ? config.localRerankTimeoutMs : 60_000
+    // A cold local child loads ~280MB before it can score anything, and that load
+    // shares this single deadline with the inference it precedes. Without an
+    // allowance the first query after a restart (or after an idle release) could
+    // be killed mid-load, which used to latch the readiness gate and leave the
+    // reranker unusable until a manual self-test (issue #18). The allowance is
+    // granted only when the child has not scored anything yet.
+    const rerankTimeoutMs = rerankModel.startsWith('local:')
+      ? config.localRerankTimeoutMs + (localRerankChildIsWarm() ? 0 : LOCAL_RERANK_LOAD_ALLOWANCE_MS)
+      : 60_000
     try {
       const scores = await rerankCandidates(
         config.rerankBaseUrl,
@@ -3278,11 +3405,13 @@ export class KnowledgeService extends Service {
       configured: true,
       provider: this.rerankProvider(model),
       model,
-      status: 'degraded',
+      // A gate refusal is not a degradation: nothing was attempted, so say so
+      // and omit the elapsed time rather than reporting a failure at 0ms.
+      status: skipped ? 'skipped' : 'degraded',
       attempted: !skipped,
       applied: false,
       candidateCount,
-      elapsedMs,
+      ...(skipped ? {} : { elapsedMs }),
       error,
     }
   }
@@ -3444,11 +3573,22 @@ export class KnowledgeService extends Service {
     // A delete that landed mid-embedding must not resurrect the row nor write
     // chunks under a deleted base (Cherry's deleting-guard).
     if (store.getDocument(half.id) === undefined || store.getBase(input.baseId) === undefined) {
+      // A delete landed mid-embedding: the row is gone, so any batch that had
+      // already passed its liveness check must not survive as orphan chunks
+      // that keep matching the retrieval lanes.
+      await store.deleteChunks(half.id).catch(() => {})
       this.indexing.delete(half.id)
       return half
     }
+    // `half` carries the crash-resumable `incomplete` marker written before
+    // embedding. The completing write must drop it: leaving it set made startup
+    // recovery treat every imported document as an interrupted import, so a
+    // default restart re-indexed the whole library — and with auto-resume off,
+    // re-marked it failed on every start. `reindexDocument` clears it the same
+    // way.
+    const { incomplete: _resumableMarker, ...completed } = half
     const document: KnowledgeDocument = {
-      ...half,
+      ...completed,
       chunkCount: chunks.length,
       ...(embeddingError !== undefined
         ? { embeddingError, ...(embeddingErrorCode !== undefined ? { errorCode: embeddingErrorCode } : {}) }
@@ -3610,7 +3750,26 @@ export class KnowledgeService extends Service {
       } catch (error) {
         embeddingError = error instanceof Error ? error.message : String(error)
         embeddingErrorCode ??= 'embedding_provider'
+        // Record it where /indexing-status can see it, with the REAL phase and
+        // code. Only the parse path used to write this map (and it hardcoded
+        // phase 'parsing'), so an embedding failure was visible as
+        // `phase: "embedding", progress: 0` and then vanished with no error.
+        // buildChunks serves both import and reindex, so this covers both.
+        this.indexingFailures.set(docId, {
+          baseId,
+          title,
+          phase: 'embedding',
+          code: embeddingErrorCode,
+          message: safeIndexingErrorMessage(embeddingError),
+          expireAt: Date.now() + FAILURE_LINGER_TTL_MS,
+        })
         this.ctx.logger.warn(`knowledge: embedding during import failed, storing lexical-only chunks: ${embeddingError}`)
+        // A local model that cannot embed must not keep reporting `ready` in the
+        // settings poller: previously only the download path marked an error, so
+        // every embed could fail while /local-model-status stayed green.
+        if (config.embeddingProvider === 'local' && config.embeddingModel.trim() !== '') {
+          markLocalModelError(config.embeddingModel, embeddingError)
+        }
       } finally {
         const active = this.indexing.get(docId)
         this.indexing.delete(docId)
@@ -3673,7 +3832,15 @@ export class KnowledgeService extends Service {
   }
 
   private requireStore(): Store {
-    if (this.store === undefined) throw new Error('knowledge store is not ready')
+    if (this.store === undefined) {
+      // A durable backend that failed to open is NOT an empty library: report
+      // the real cause so the panel and the model both see "storage
+      // unavailable" instead of zero bases.
+      if (this.storageError !== undefined) {
+        throw new StorageUnavailableError(`knowledge storage is unavailable: ${this.storageError.message}`)
+      }
+      throw new Error('knowledge store is not ready')
+    }
     return this.store
   }
 }
@@ -3696,30 +3863,6 @@ function embeddingKey(config: KnowledgeConfig): string | undefined {
     : config.embeddingModel.trim()
   if (model === '') return undefined
   return `${config.embeddingProvider}:${model}`
-}
-
-/**
- * Report actual retrieval contribution rather than inspecting whether one
- * arbitrary final row happened to carry both scores. RRF legitimately admits
- * one-lane rows, so the old per-row `&&` test misreported vector-only results
- * as lexical (Issue #16).
- */
-function retrievalStatusFromRanked(requestedMode: SearchMode, ranked: readonly RankedHit[]): RetrievalStatus {
-  const vectorCount = ranked.reduce((count, hit) => count + (hit.vectorScore !== undefined ? 1 : 0), 0)
-  const lexicalCount = ranked.reduce((count, hit) => count + (hit.lexicalScore !== undefined ? 1 : 0), 0)
-  const vectorRequested = requestedMode === 'vector' || requestedMode === 'hybrid' || requestedMode === 'auto'
-  const lexicalRequested = requestedMode !== 'vector'
-  const effectiveMode: SearchMode = vectorCount > 0 && lexicalCount > 0
-    ? 'hybrid'
-    : vectorCount > 0
-      ? 'vector'
-      : 'lexical'
-  return {
-    requestedMode,
-    effectiveMode,
-    lexical: { attempted: lexicalRequested, succeeded: lexicalCount > 0, returnedCount: lexicalCount },
-    vector: { attempted: vectorRequested, succeeded: vectorCount > 0, returnedCount: vectorCount },
-  }
 }
 
 function retrievalStatus(
@@ -4109,26 +4252,66 @@ function rawExtensionOf(relativePath: string): string {
 /** Hosts that must never be fetched by URL import — loopback, link-local,
  *  and RFC1918 private ranges. Blocks the classic SSRF targets (metadata
  *  endpoints, internal services); DNS-rebinding is outside this check (the
- *  plugin trusts the host's resolver for public names). */
+ *  plugin trusts the host's resolver for public names).
+ *
+ *  Entries are the forms `URL.hostname` actually returns: it keeps the brackets
+ *  on an IPv6 literal, and the lookup below strips them before comparing, so the
+ *  previous bracketed entries could never match and EVERY IPv6 host bypassed the
+ *  guard (`http://[::1]/`, `http://[::ffff:127.0.0.1]:11434/`). Literal
+ *  addresses are now classified with `isIP` instead of a string table. */
 const BLOCKED_URL_HOSTS = new Set([
   'localhost',
-  '127.0.0.1',
-  '[::1]',
-  '[::]',
   '0.0.0.0',
-  '169.254.169.254',
   'metadata.google.internal',
 ])
+
+/** Private, loopback, link-local, CGNAT, benchmarking, multicast and reserved
+ *  IPv4 space: none of it is a legitimate target for a document-supplied URL. */
+function isBlockedIpv4(host: string): boolean {
+  const parts = host.split('.').map(part => Number(part))
+  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return true
+  const a = parts[0]!
+  const b = parts[1]!
+  if (a === 0 || a === 10 || a === 127) return true
+  if (a === 169 && b === 254) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 168) return true
+  if (a === 100 && b >= 64 && b <= 127) return true
+  if (a === 192 && b === 0) return true
+  if (a === 198 && (b === 18 || b === 19)) return true
+  if (a >= 224) return true
+  return false
+}
+
+/** Loopback, unspecified, unique-local, link-local and multicast IPv6, plus the
+ *  forms that reach the IPv4 stack (IPv4-mapped, in both notations). */
+function isBlockedIpv6(host: string): boolean {
+  if (host === '::' || host === '::1') return true
+  const mappedDotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host)
+  if (mappedDotted !== null) return isBlockedIpv4(mappedDotted[1]!)
+  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host)
+  if (mappedHex !== null) {
+    const high = Number.parseInt(mappedHex[1]!, 16)
+    const low = Number.parseInt(mappedHex[2]!, 16)
+    return isBlockedIpv4(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`)
+  }
+  const firstGroup = host.split(':').find(part => part.length > 0)
+  const first = firstGroup === undefined ? 0 : Number.parseInt(firstGroup, 16)
+  if (Number.isNaN(first)) return true
+  if ((first & 0xfe00) === 0xfc00) return true // fc00::/7 unique local
+  if ((first & 0xffc0) === 0xfe80) return true // fe80::/10 link local
+  if ((first & 0xff00) === 0xff00) return true // ff00::/8 multicast
+  return false
+}
 
 function isBlockedUrlHost(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
   if (BLOCKED_URL_HOSTS.has(host)) return true
-  // IPv4 private + link-local ranges, including `127.0.0.0/8` variants.
-  if (/^127\./.test(host)) return true
-  if (/^(10\.|192\.168\.)/.test(host)) return true
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true
-  if (/^169\.254\./.test(host)) return true
-  if (/^0\./.test(host)) return true
+  const family = isIP(host)
+  if (family === 4) return isBlockedIpv4(host)
+  if (family === 6) return isBlockedIpv6(host)
+  // Named hosts keep the documented posture: the resolver is trusted, so only
+  // the explicit deny-list above applies.
   return false
 }
 

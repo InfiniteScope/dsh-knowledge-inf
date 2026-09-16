@@ -176,6 +176,12 @@ export interface Store {
   recoverInterruptedImports(startedAt: number): Promise<{ removed: number; resume: string[] }>
   /** Remove raw source copies no document references (orphans from failed/duplicate imports). */
   reconcileOrphanRaws(): Promise<number>
+  /** Remove chunk rows whose document no longer exists — the mirror of
+   *  {@link reconcileOrphanRaws} for the chunk store. Returns how many orphaned
+   *  documents had their chunks removed. A delete that lands while a batch is
+   *  in flight can leave rows behind that keep matching the retrieval lanes
+   *  (they scope by base, not by document existence). */
+  reconcileOrphanChunks(): Promise<number>
   /** Aggregate chunk stats without loading chunk rows. */
   chunkStats(baseIds: readonly string[]): ChunkStats
   /** SQL-backed retrieval lanes (FTS5 + vector scan); absent on in-memory stores. */
@@ -215,43 +221,69 @@ export interface OpenStoreOptions {
   legacyJsonPath?: string
 }
 
+/** The durable backend exists but could not be opened or healed. Callers must
+ *  report this rather than pretend the library is empty: the data is intact on
+ *  disk, and an ephemeral store would silently discard every later write. */
+export class StorageUnavailableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = 'StorageUnavailableError'
+  }
+}
+
 /**
  * Open a durable store. Business state comes from the domain facility; chunks
  * live in a plugin-owned SQLite file (`chunkStorePath`, defaulted under
  * `<DSH_HOME>/storages`). A one-time migration moves any chunks still stored
- * in the legacy JSON unit file into the SQLite store. Falls back to memory
- * when the facility is absent or fails.
+ * in the legacy JSON unit file into the SQLite store.
+ *
+ * Falls back to memory only when there is no facility at all (headless runs and
+ * tests). Once the durable backend has been opened, a later failure — a failed
+ * migration, a locked file, a rejected reconciliation write — throws
+ * {@link StorageUnavailableError} instead of degrading: an in-memory store
+ * would show an empty library while the user's data sits safely on disk, and
+ * everything written that session would be lost on restart.
  */
 export async function openStore(
   facility: StorageDomainFacility | undefined,
   options?: OpenStoreOptions,
 ): Promise<Store> {
-  if (facility !== undefined) {
+  if (facility === undefined) return new MemoryStore()
+  const domain = await facility.open(knowledgeDomainSpec)
+  let chunkDb: ChunkDatabase | undefined
+  try {
+    const chunkStorePath = resolveChunkStorePath(options?.chunkStorePath)
+    chunkDb = new ChunkDatabase(chunkStorePath)
+    await migrateLegacyChunkFile(options?.legacyJsonPath ?? legacyChunkFilePath(), chunkDb, message => console.warn(message))
+    // Original source bytes live next to the chunk store (Cherry's `raw/`
+    // material store): `<chunkStoreDir>/knowledge-raw`.
+    const raw = new RawFileStorage(join(dirname(chunkStorePath), 'knowledge-raw'))
+    const store = new DomainStore(domain, chunkDb, raw)
+    // Startup self-healing: drop documents a crashed import left behind
+    // (pure placeholders with no recoverable text), then reconcile stale
+    // chunkCount metadata. Resume candidates (rawText present, chunks
+    // partial) are re-indexed by the service after openStore returns.
+    const recovery = await store.recoverInterruptedImports(Date.now())
+    if (recovery.removed > 0) console.warn(`dsh-knowledge: removed ${recovery.removed} incomplete import(s) left by an interrupted run`)
+    await store.reconcileChunkCounts()
+    const orphaned = await store.reconcileOrphanRaws()
+    if (orphaned > 0) console.warn(`dsh-knowledge: removed ${orphaned} orphaned raw source file(s) no document referenced`)
+    const orphanChunks = await store.reconcileOrphanChunks()
+    if (orphanChunks > 0) console.warn(`dsh-knowledge: removed chunks left by ${orphanChunks} deleted document(s)`)
+    return store
+  } catch (error) {
+    // Close what was already opened — a leaked SQLite handle also keeps the
+    // write lock and can block the file on Windows — then fail loudly.
     try {
-      const domain = await facility.open(knowledgeDomainSpec)
-      const chunkStorePath = resolveChunkStorePath(options?.chunkStorePath)
-      const chunkDb = new ChunkDatabase(chunkStorePath)
-      await migrateLegacyChunkFile(options?.legacyJsonPath ?? legacyChunkFilePath(), chunkDb, message => console.warn(message))
-      // Original source bytes live next to the chunk store (Cherry's `raw/`
-      // material store): `<chunkStoreDir>/knowledge-raw`.
-      const raw = new RawFileStorage(join(dirname(chunkStorePath), 'knowledge-raw'))
-      const store = new DomainStore(domain, chunkDb, raw)
-      // Startup self-healing: drop documents a crashed import left behind
-      // (pure placeholders with no recoverable text), then reconcile stale
-      // chunkCount metadata. Resume candidates (rawText present, chunks
-      // partial) are re-indexed by the service after openStore returns.
-      const recovery = await store.recoverInterruptedImports(Date.now())
-      if (recovery.removed > 0) console.warn(`dsh-knowledge: removed ${recovery.removed} incomplete import(s) left by an interrupted run`)
-      await store.reconcileChunkCounts()
-      const orphaned = await store.reconcileOrphanRaws()
-      if (orphaned > 0) console.warn(`dsh-knowledge: removed ${orphaned} orphaned raw source file(s) no document referenced`)
-      return store
-    } catch (error) {
-      // Fall through to memory on any open failure (no backend, version mismatch, …).
-      console.warn(`dsh-knowledge: storage domain unavailable, using in-memory store: ${error instanceof Error ? error.message : String(error)}`)
+      chunkDb?.close()
+    } catch {
+      // best effort: the original failure is the one worth reporting
     }
+    throw new StorageUnavailableError(
+      `knowledge storage could not be opened: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    )
   }
-  return new MemoryStore()
 }
 
 class DomainStore implements Store {
@@ -330,11 +362,15 @@ class DomainStore implements Store {
   }
 
   async deleteChunks(docId: string, baseId?: string): Promise<void> {
-    this.chunkDb.deleteChunks(docId, baseId)
+    // `await`, not a bare call: the lane batches its sweep and yields to the
+    // event loop, so returning early would let the caller delete the document
+    // row while chunk rows are still present (they keep matching search), and
+    // would turn any later failure into an unhandled rejection.
+    await this.chunkDb.deleteChunks(docId, baseId)
   }
 
   async deleteChunksByBase(baseId: string): Promise<void> {
-    this.chunkDb.deleteChunksByBase(baseId)
+    await this.chunkDb.deleteChunksByBase(baseId)
   }
 
   listEmbeddingVectorsByHashes(hashes: readonly string[], embeddingModel: string): Map<string, number[]> {
@@ -427,6 +463,22 @@ class DomainStore implements Store {
     return this.chunkDb.chunkStats(baseIds)
   }
 
+  async reconcileOrphanChunks(): Promise<number> {
+    const known = new Set<string>()
+    for (const base of this.listBases()) {
+      for (const doc of this.listDocuments(base.id)) known.add(doc.id)
+    }
+    let removed = 0
+    for (const docId of this.chunkDb.docIdsWithChunks()) {
+      if (known.has(docId)) continue
+      // deleteChunks batches the sweep, fires the FTS tombstones, and drops the
+      // doc from the vector cache — the same path a normal delete takes.
+      await this.chunkDb.deleteChunks(docId)
+      removed += 1
+    }
+    return removed
+  }
+
   get retrievalLane(): RetrievalLane {
     return this.chunkDb
   }
@@ -481,9 +533,22 @@ class DomainStore implements Store {
     }
   }
 
-  private async writeGlobal(patch: { overrides?: ConfigOverrides; groups?: string[]; enabled?: boolean; enabledBaseIds?: string[] }): Promise<void> {
-    const current = this.readGlobal()
-    await (this.domain.global as { set(value: unknown): Promise<void> }).set({ ...current, ...patch })
+  /** Serialize read-modify-write over the single global slot. `global.set`
+   *  overwrites the record, so two concurrent settings writes both read
+   *  revision n and the later one drops the earlier field (a freshly selected
+   *  base list disappearing because another request wrote the previous list back
+   *  with its own patch). */
+  private globalWriteChain: Promise<void> = Promise.resolve()
+
+  private writeGlobal(patch: { overrides?: ConfigOverrides; groups?: string[]; enabled?: boolean; enabledBaseIds?: string[] }): Promise<void> {
+    const next = this.globalWriteChain.then(async () => {
+      const current = this.readGlobal()
+      await (this.domain.global as { set(value: unknown): Promise<void> }).set({ ...current, ...patch })
+    })
+    // Keep the chain usable after a failure: one rejected write must not poison
+    // every later settings write.
+    this.globalWriteChain = next.catch(() => {})
+    return next
   }
 
   async close(): Promise<void> {
@@ -637,6 +702,11 @@ class MemoryStore implements Store {
 
   async reconcileOrphanRaws(): Promise<number> {
     // In-memory store keeps no raw files on disk.
+    return 0
+  }
+
+  async reconcileOrphanChunks(): Promise<number> {
+    // The in-memory store deletes chunks with their document in one op.
     return 0
   }
 

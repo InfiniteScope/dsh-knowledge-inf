@@ -135,6 +135,8 @@ Directory imports recursively scan `txt`, `md`, `csv`, `html`, `json`, `pdf`, `d
 
 A directory rescan imports new files, rebuilds changed files, and removes files that disappeared from disk. One failed item does not obscure successful imports; the service and UI retain per-file errors.
 
+**How to update an already-imported directory**: import the same path again, or rescan the directory container in the panel. Both now take the same synchronization path and update the original tree in place. A directory source is identified by its knowledge base plus its resolved real path, so a repeat import never builds a second tree. Files inside it are identified by that source plus their relative path; a legacy file is adopted only when its name and kind are unique, and two candidates are reported as `ambiguous_source` rather than guessed, merged, or deleted. Administrative document details return the container's `sourcePath`, so a client can tell which container to rescan.
+
 </details>
 
 ### Retrieval and evidence flow
@@ -183,6 +185,8 @@ The default local embedding model is `onnx-community/Qwen3-Embedding-0.6B-ONNX`,
 `rerankModel: local:Xenova/bge-reranker-base` runs in its own child process, independent from the embedding process. Search never downloads a reranker implicitly; the model must be downloaded and pass its health check first. Custom Hugging Face ONNX rerankers are experimental and must pass single-logit capability validation plus a positive/negative self-test.
 
 Models are cached under `<DSH_HOME>/cache/dsh-knowledge/local-models` by default. Set `hfEndpoint` in the panel or use the `HF_ENDPOINT` environment variable to choose a mirror. OCR defaults to `hf-mirror.com`; users outside China can use `https://huggingface.co`.
+
+A download is **not tied to the HTTP request that started it**: it keeps running in the background after that request returns, so closing the browser or letting a client time out never cancels it — progress stays visible through the local model status. Stopping a download requires an explicit cancel, and cancelling stops only an in-flight transfer: a complete, validated model is never deleted (that is what delete is for). The request budget is re-armed by progress, so a slow link is never killed for taking long; only a long stretch with no progress is treated as stuck.
 
 </details>
 
@@ -319,7 +323,7 @@ Injected material is explicitly labelled as untrusted reference evidence and can
 | Empty or stale base/document filters | Only `undefined` means unrestricted; an empty set matches zero documents in both SQLite lanes | A filtering mistake cannot silently search the whole library |
 | Remote-rerank timeout or malformed output | Shared deadline, strict result-index and score validation, structured `rerank` status | Return the original recall order and do not apply a rerank threshold |
 | Local embedding or rerank hangs/crashes | Independent child processes, versioned strict IPC, hard-timeout termination, one clean embedding recovery, and separate lifecycles | Recover or degrade the affected operation without restarting DSH or the other local-model lane |
-| Incomplete or incompatible local weights | Require configuration, tokenizer files, and non-empty ONNX weights; write a runtime-versioned, file-fingerprinted readiness marker only after self-test | Search never downloads implicitly or treats “an ONNX file exists” as readiness |
+| Incomplete or incompatible local weights | Record each weights file's expected byte size during download and compare it on disk; **quarantine and remove** a cache that fails to load so the next attempt re-downloads. Cancelling a download stops only an in-flight transfer and **never** deletes a complete, validated model | A truncated file is no longer treated as downloaded and left failing forever; search never downloads implicitly or treats “an ONNX file exists” as readiness |
 | Repeated local-rerank failures | Total queue cap of 16; open a five-minute circuit after three consecutive timeout/crash/runtime/invalid-response failures, with one half-open probe | Prevent a broken model from repeatedly consuming process and latency budgets |
 | Partial replacement rebuild or directory rescan | Replace the committed source only after the new raw source, parse, and index succeed; retain per-file results | One failed item does not destroy the old version or hide successful siblings |
 | Missing release files or platform drift | Node 22.19/24/26 quality gates, Windows/Linux/macOS native tests, Windows/Linux tarball install-and-boot smoke, and manually triggered real local-model smoke | Both source builds and the published npm shape are continuously checked |

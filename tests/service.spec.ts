@@ -266,9 +266,13 @@ describe('KnowledgeService', () => {
     const started = await service.startReindexBase(base.id)
     expect(started.total).toBe(3)
 
-    // Poll the job until it settles (fast with the lexical-only provider).
+    // Poll the job until it settles (fast with the lexical-only provider). A
+    // wall-clock deadline, not a fixed iteration count: a contended runner needs
+    // more event-loop turns than any small constant allows, and this is the
+    // pattern that already caused one intermittent CI failure.
     let status = service.reindexJobStatus(started.jobId)
-    for (let i = 0; i < 50 && (status === undefined || !status.done); i += 1) {
+    const deadline = process.hrtime.bigint() + 10_000_000_000n
+    while ((status === undefined || !status.done) && process.hrtime.bigint() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 10))
       status = service.reindexJobStatus(started.jobId)
     }
@@ -918,7 +922,12 @@ describe('KnowledgeService', () => {
     // Selecting the directory AND one of its descendants folds to the root:
     // the subtree is deleted once, everything below it goes with it.
     const deleted = await service.deleteDocuments([root.id, leaf.id, top.id], { recursive: true })
-    expect(deleted.deleted).toBe(2) // root (with subtree) + top
+    // `deleted` counts DOCUMENTS removed (the whole root subtree: root, child,
+    // leaf — plus top), while `roots` reports how many folded selections did the
+    // work. Reporting only the folded count made the confirmation dialog ("delete
+    // these 3 rows") and the result disagree about the same action.
+    expect(deleted.deleted).toBe(4)
+    expect(deleted.roots).toBe(2)
     expect(service.listDocuments(base.id)).toHaveLength(0)
   })
 
@@ -1011,6 +1020,25 @@ describe('KnowledgeService', () => {
     await expect(service.addUrlDocument({ baseId: base.id, url: 'http://169.254.169.254/latest/meta-data' }))
       .rejects.toThrow(/host not allowed/)
     await expect(service.addUrlDocument({ baseId: base.id, url: 'http://192.168.1.1/status' }))
+      .rejects.toThrow(/host not allowed/)
+    // IPv6 loopback, unspecified and private/link-local ranges. These used to
+    // pass: the deny-list held BRACKETED literals while the lookup stripped the
+    // brackets first, so every IPv6 host bypassed the guard.
+    for (const url of [
+      'http://[::1]:8080/secret',
+      'http://[::]/',
+      'http://[fd00::1]/internal',
+      'http://[fe80::1]/internal',
+      'http://[::ffff:127.0.0.1]:11434/api/tags',
+      'http://[::ffff:7f00:1]/x',
+      'http://[ff02::1]/x',
+    ]) {
+      await expect(service.addUrlDocument({ baseId: base.id, url })).rejects.toThrow(/host not allowed/)
+    }
+    // CGNAT and benchmarking ranges are not legitimate targets either.
+    await expect(service.addUrlDocument({ baseId: base.id, url: 'http://100.64.0.1/' }))
+      .rejects.toThrow(/host not allowed/)
+    await expect(service.addUrlDocument({ baseId: base.id, url: 'http://198.18.0.1/' }))
       .rejects.toThrow(/host not allowed/)
     await expect(service.addUrlDocument({ baseId: base.id, url: 'file:///etc/passwd' }))
       .rejects.toThrow(/protocol not allowed/)

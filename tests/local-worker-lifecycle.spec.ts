@@ -9,7 +9,7 @@ interface ProcessDouble {
   killed: boolean
 }
 
-type ProcessMode = 'success' | 'crash_once' | 'mismatch' | 'invalid_vectors' | 'hang_download'
+type ProcessMode = 'success' | 'crash_once' | 'mismatch' | 'invalid_vectors' | 'hang_download' | 'runtime_error_once'
 const processState = vi.hoisted(() => ({ instances: [] as ProcessDouble[], mode: 'success' as ProcessMode }))
 
 vi.mock('node:child_process', async () => {
@@ -29,6 +29,20 @@ vi.mock('node:child_process', async () => {
         if (request.operation === 'embed' && processState.mode === 'crash_once') {
           processState.mode = 'success'
           queueMicrotask(() => this.emit('exit', 1, 'SIGKILL'))
+          return true
+        }
+        if (request.operation === 'embed' && processState.mode === 'runtime_error_once') {
+          // A failure the child reports about itself (ONNX session, invalid
+          // response) is process-local: the runtime must replace the child
+          // rather than retry inside the same one.
+          processState.mode = 'success'
+          queueMicrotask(() => this.emit('message', {
+            protocolVersion: request.protocolVersion,
+            id: request.id,
+            operation: request.operation,
+            ok: false,
+            error: { code: 'runtime_error', message: 'onnx failed', retryable: true },
+          }))
           return true
         }
         if (request.operation === 'download' && processState.mode === 'hang_download') {
@@ -158,6 +172,16 @@ describe('local embedding process lifecycle', () => {
     await expect(embedTexts('local', '', 'test/model', '', ['evidence'])).resolves.toEqual([[1, 0]])
     expect(processState.instances).toHaveLength(2)
     expect(processState.instances[0]?.killed).toBe(false)
+  })
+
+  it('replaces the child when it reports a runtime error, so the retry is a real restart', async () => {
+    processState.mode = 'runtime_error_once'
+    await expect(embedTexts('local', '', 'test/model', '', ['evidence'])).resolves.toEqual([[1, 0]])
+    // Retrying inside the SAME child cannot heal an ONNX failure — the binding
+    // that failed to register stays failed for the life of that process — so the
+    // runtime must replace it for the single retry to mean anything (issue #17c).
+    expect(processState.instances).toHaveLength(2)
+    expect(processState.instances[0]?.killed).toBe(true)
   })
 
   it('promotes a fully probed staging download without overwriting the final cache mid-download', async () => {

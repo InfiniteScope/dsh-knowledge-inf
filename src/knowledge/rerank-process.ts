@@ -1,7 +1,7 @@
 /** Dedicated local cross-encoder process. Never imported by the host. */
 
-import { readdir, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readdir, rm, stat } from 'node:fs/promises'
+import { basename, join } from 'node:path'
 import { applyGlobalProxy, NETWORK_HINT } from './net.js'
 import { CrossEncoderResponseError, scoreCrossEncoder } from './rerank-adapter.js'
 import {
@@ -61,18 +61,33 @@ async function loadTransformers(): Promise<TransformersModule> {
   return transformers
 }
 
-async function hasOnnxWeights(modelId: string, cacheDir: string): Promise<boolean> {
+/** Weights are complete only when the downloader reported an expected size for
+ *  the weights file and the file on disk matches it. The previous test — "any
+ *  non-empty `.onnx` exists" — accepted a truncated file, which then skipped the
+ *  download branch forever while the local load kept failing: a permanent,
+ *  self-concealing failure the user could only clear by hand. */
+async function weightsAreComplete(modelId: string, cacheDir: string, expected: ReadonlyMap<string, number>): Promise<boolean> {
   try {
     const names = await readdir(join(cacheDir, modelId, 'onnx'))
     for (const name of names) {
       if (!name.endsWith('.onnx')) continue
       const info = await stat(join(cacheDir, modelId, 'onnx', name))
-      if (info.isFile() && info.size > 0) return true
+      if (!info.isFile() || info.size <= 0) continue
+      const total = expected.get(name)
+      // Without a recorded total the file can only be judged non-empty, which is
+      // exactly the case that needs the quarantine path below.
+      if (total === undefined || total <= 0 || info.size === total) return true
     }
   } catch {
     return false
   }
   return false
+}
+
+/** Drop a model directory whose weights cannot be loaded, so the next attempt
+ *  downloads again instead of failing forever against a corrupt cache. */
+async function quarantineModel(modelId: string, cacheDir: string): Promise<void> {
+  await rm(join(cacheDir, modelId), { recursive: true, force: true }).catch(() => {})
 }
 
 function applyEndpoint(tf: TransformersModule, endpoint: string | undefined): void {
@@ -93,11 +108,18 @@ async function createRunner(request: LocalRerankRequest): Promise<Runner> {
   tf.env.cacheDir = request.cacheDir
   tf.env.allowLocalModels = true
 
-  if (!(await hasOnnxWeights(request.modelId, request.cacheDir))) {
+  // Expected byte size per weights file, straight from the downloader's own
+  // progress events — no extra registry call, and it is what lets a truncated
+  // file be told apart from a complete one.
+  const expectedSizes = new Map<string, number>()
+  if (!(await weightsAreComplete(request.modelId, request.cacheDir, expectedSizes))) {
     tf.env.allowRemoteModels = true
     progress(request.modelId, 'downloading', 0)
     let lastProgressAt = 0
-    const progressCallback = (info: { status?: string; progress?: number }): void => {
+    const progressCallback = (info: { status?: string; progress?: number; file?: string; loaded?: number; total?: number }): void => {
+      if (typeof info.file === 'string' && typeof info.total === 'number' && info.total > 0) {
+        expectedSizes.set(basename(info.file), info.total)
+      }
       if (info.status !== 'progress' || typeof info.progress !== 'number') return
       const now = Date.now()
       if (now - lastProgressAt < 250) return
@@ -118,17 +140,44 @@ async function createRunner(request: LocalRerankRequest): Promise<Runner> {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       progress(request.modelId, 'error', 0, `${message} · ${NETWORK_HINT}`)
+      // A failed transfer must not leave a half-written cache that the next run
+      // would accept as downloaded.
+      await quarantineModel(request.modelId, request.cacheDir)
       throw error
     } finally {
       await downloadedModel?.dispose?.().catch(() => {})
     }
+    if (!(await weightsAreComplete(request.modelId, request.cacheDir, expectedSizes))) {
+      await quarantineModel(request.modelId, request.cacheDir)
+      const message = 'local rerank weights are incomplete after download (the transfer was truncated); the partial cache was removed, retry the download'
+      progress(request.modelId, 'error', 0, `${message} · ${NETWORK_HINT}`)
+      throw new Error(message)
+    }
   }
 
-  progress(request.modelId, 'validating', 100)
+  // Deliberately NOT publishing 'validating' here. A routine load is not a
+  // verification, and publishing it as one re-armed the readiness gate's
+  // "checking" veto for every concurrent search whenever a child started (first
+  // use, after an idle kill, after a dispose, or on a model switch) — issue #18.
+  // The load reports `ready` below, and only a real self-test announces
+  // validation.
   tf.env.allowRemoteModels = false
   const localPath = join(request.cacheDir, request.modelId)
-  const model = await tf.AutoModel.from_pretrained(localPath, { dtype: 'q8', local_files_only: true, trust_remote_code: false })
-  const tokenizer = await tf.AutoTokenizer.from_pretrained(localPath, { local_files_only: true, trust_remote_code: false })
+  let model: Awaited<ReturnType<TransformersModule['AutoModel']['from_pretrained']>>
+  let tokenizer: Awaited<ReturnType<TransformersModule['AutoTokenizer']['from_pretrained']>>
+  try {
+    model = await tf.AutoModel.from_pretrained(localPath, { dtype: 'q8', local_files_only: true, trust_remote_code: false })
+    tokenizer = await tf.AutoTokenizer.from_pretrained(localPath, { local_files_only: true, trust_remote_code: false })
+  } catch (error) {
+    // A cache that exists but cannot be loaded is worthless and was previously
+    // permanent: `hasOnnxWeights` kept reporting "downloaded" while every load
+    // failed. Discard it so the next attempt re-downloads.
+    await quarantineModel(request.modelId, request.cacheDir)
+    const detail = error instanceof Error ? error.message : String(error)
+    const message = `local rerank model could not be loaded from the cache (${detail}); the cache was removed, retry to download it again`
+    progress(request.modelId, 'error', 0, message)
+    throw new Error(message)
+  }
   let safeBatchSize = 16
   return {
     modelId: request.modelId,

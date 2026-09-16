@@ -321,6 +321,7 @@ async function parsePdf(buffer: Uint8Array): Promise<string> {
   // local OCR models are downloaded, recognize the full-page renders. Without
   // the models the original error stands, pointing at the settings panel.
   let ocrReady = false
+  let ocrFailure: string | undefined
   try {
     const { isOcrReady, ocrPdfText } = await import('./ocr.js')
     ocrReady = isOcrReady()
@@ -328,11 +329,18 @@ async function parsePdf(buffer: Uint8Array): Promise<string> {
       const recognized = await ocrPdfText(buffer)
       if (recognized.trim().length > 0) return recognized
     }
-  } catch {
-    // OCR unavailable — keep the original error
+  } catch (error) {
+    // The models ARE downloaded (isOcrReady() was true), so this is an engine
+    // failure — telling the user to download models they already have sends them
+    // in the wrong direction (issue #17).
+    ocrFailure = error instanceof Error ? error.message : String(error)
+    console.warn(`[dsh-knowledge] OCR failed for a scanned PDF: ${ocrFailure}`)
   }
   if (primaryError !== null) {
     throw new Error(`PDF parsing failed: ${primaryError.message}`)
+  }
+  if (ocrFailure !== undefined) {
+    throw new Error(`PDF contains no extractable text and OCR failed: ${ocrFailure}`)
   }
   throw new Error(
     ocrReady

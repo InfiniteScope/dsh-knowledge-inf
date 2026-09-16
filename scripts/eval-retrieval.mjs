@@ -25,7 +25,13 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const BASE_URL = process.env.DSH_URL ?? 'http://127.0.0.1:3080'
-const DEFAULT_SET = new URL('./eval-questions.json', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
+// The private set lives OUTSIDE the published directory: `scripts/` ships in the
+// npm package, so a real set kept there would be committed and published (the
+// privacy regression the 0.2.12 changelog records). `eval/` is git-ignored.
+const EVAL_SET_CANDIDATES = [
+  new URL('../eval/eval-questions.json', import.meta.url),
+  new URL('./eval-questions.json', import.meta.url),
+].map(url => url.pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`)
@@ -50,9 +56,10 @@ async function search(query, baseId, topK, mode) {
   return body.value
 }
 
-const setPath = resolve(arg('file', DEFAULT_SET))
+const discovered = EVAL_SET_CANDIDATES.find(candidate => existsSync(candidate))
+const setPath = resolve(arg('file', discovered ?? EVAL_SET_CANDIDATES[0]))
 if (!existsSync(setPath)) {
-  console.error(`eval set not found: ${setPath}\nCopy scripts/eval-questions.example.json to scripts/eval-questions.json and fill in real questions.`)
+  console.error(`eval set not found: ${setPath}\nCopy scripts/eval-questions.example.json to eval/eval-questions.json and fill in real questions (eval/ is git-ignored and never published).`)
   process.exit(1)
 }
 const set = JSON.parse(readFileSync(setPath, 'utf8'))

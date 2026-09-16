@@ -3,7 +3,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { formatUninstallWarning, runSupervised, verifyUninstallOutcome } from './smoke-packed-lifecycle.mjs'
 
@@ -15,8 +15,11 @@ function command(name) {
   return process.platform === 'win32' ? `${name}.cmd` : name
 }
 
+/** `pack` uses npm-only flags (`--ignore-scripts`, `--cache`), which pnpm's own
+ *  CLI rejects, so an `npm_execpath` pointing at pnpm cannot be reused here. */
 function npmInvocation(args) {
-  if (process.env.npm_execpath !== undefined) return [process.execPath, [process.env.npm_execpath, ...args]]
+  const execpath = process.env.npm_execpath
+  if (execpath !== undefined && !/^pnpm/i.test(basename(execpath))) return [process.execPath, [execpath, ...args]]
   return [command('npm'), args]
 }
 

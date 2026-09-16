@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { knowledgeDomainSpec } from '../src/knowledge/domain.js'
 import { ChunkDatabase, hashEmbeddingText, migrateLegacyChunkFile } from '../src/knowledge/chunkdb.js'
-import { openStore } from '../src/knowledge/store.js'
+import { openStore, StorageUnavailableError } from '../src/knowledge/store.js'
 import type { StorageDomainFacility, Store } from '../src/knowledge/store.js'
 import { KnowledgeService } from '../src/knowledge/index.js'
 import type { Config } from '../src/knowledge/config.js'
@@ -262,22 +262,36 @@ describe('ChunkDatabase (per-chunk SQL layout)', () => {
     }
   })
 
-  it('skips the unit-file migration once the store already holds chunks', async () => {
+  it('resumes the unit-file migration per document instead of skipping it wholesale', async () => {
     const dir = await tempDir()
     try {
       const legacy = {
         unit: { name: 'knowledge', version: 0 },
         global: null,
-        tables: { bases: {}, documents: {}, chunks: { 'c1': { id: 'c1', docId: 'd1', baseId: 'b1', index: 0, text: 'a' } } },
+        tables: {
+          bases: {},
+          documents: {},
+          chunks: {
+            c1: { id: 'c1', docId: 'd1', baseId: 'b1', index: 0, text: 'never migrated' },
+            c2: { id: 'c2', docId: 'd9', baseId: 'b9', index: 0, text: 'already stored' },
+          },
+        },
       }
       const jsonPath = join(dir, 'knowledge.json')
       await writeFile(jsonPath, JSON.stringify(legacy))
 
       const db = new ChunkDatabase(join(dir, 'chunks.sqlite'))
+      // d9 was reached by a previous run; d1 was never reached because that run
+      // stopped early. A whole-store guard would strand d1 forever.
       db.putChunks([chunk('x1', 'd9', 'b9', 0, 'x')])
       const migrated = await migrateLegacyChunkFile(jsonPath, db, () => {})
-      expect(migrated).toBe(0)
-      expect(db.listChunksByDoc('d1')).toHaveLength(0)
+      expect(migrated).toBe(1)
+      expect(db.listChunksByDoc('d1')).toHaveLength(1)
+      // The document already in the store keeps its stored version.
+      expect(db.listChunksByDoc('d9').map(entry => entry.id)).toEqual(['x1'])
+
+      // Idempotent: a later run has nothing left to migrate.
+      expect(await migrateLegacyChunkFile(jsonPath, db, () => {})).toBe(0)
       db.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -1158,8 +1172,12 @@ describe('local-path import source tracking', () => {
         // than skipping every directory container.
         await writeFile(alpha, 'alpha background reindex', 'utf8')
         const started = await service.startReindexBase(base.id)
+        // Wall-clock deadline rather than a fixed iteration budget: this waits on
+        // a real background job, and a contended runner can need far more
+        // event-loop turns than any small constant allows.
         let status = service.reindexJobStatus(started.jobId)
-        for (let index = 0; index < 100 && (status === undefined || !status.done); index += 1) {
+        const deadline = process.hrtime.bigint() + 10_000_000_000n
+        while ((status === undefined || !status.done) && process.hrtime.bigint() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 10))
           status = service.reindexJobStatus(started.jobId)
         }
@@ -1214,6 +1232,85 @@ describe('local-path import source tracking', () => {
       } finally {
         await closeStore(service)
       }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('clears the crash-resumable marker when an import completes', async () => {
+    const dir = await tempDir()
+    try {
+      vi.stubEnv('DSH_HOME', dir)
+      const service = await mount(dir)
+      try {
+        const store = storeOf(service)
+        const base = await service.createBase({ name: 'completed import' })
+        const created = await service.addTextDocument({ baseId: base.id, title: 'note', content: 'a completed import body' })
+
+        // The pre-embedding write marks the row resumable; the completing write
+        // must drop the marker, or startup recovery treats every imported
+        // document as an interrupted import.
+        expect(store.getDocument(created.id)?.incomplete).toBeUndefined()
+
+        // The observable consequence: recovery finds nothing to resume.
+        const recovery = await store.recoverInterruptedImports(Date.now() + 1)
+        expect(recovery.resume).toEqual([])
+        expect(recovery.removed).toBe(0)
+      } finally {
+        await closeStore(service)
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('removes chunk rows left behind when a document row is already gone', async () => {
+    const dir = await tempDir()
+    try {
+      vi.stubEnv('DSH_HOME', dir)
+      const service = await mount(dir)
+      try {
+        const store = storeOf(service)
+        const base = await service.createBase({ name: 'orphans' })
+        const document = await service.addTextDocument({ baseId: base.id, title: 'orphan', content: 'orphan chunk body' })
+        expect(store.listChunks(base.id).length).toBeGreaterThan(0)
+
+        // Simulate a delete that landed while a batch was still in flight: the
+        // document row goes away first, the chunk rows are still there. Without
+        // reconciliation they keep matching lexical and vector search forever.
+        await store.deleteDocument(document.id)
+        expect(store.listChunks(base.id).length).toBeGreaterThan(0)
+
+        expect(await store.reconcileOrphanChunks()).toBe(1)
+        expect(store.listChunks(base.id)).toHaveLength(0)
+        // A second pass has nothing left to do.
+        expect(await store.reconcileOrphanChunks()).toBe(0)
+      } finally {
+        await closeStore(service)
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('storage failure reporting', () => {
+  it('reports storage unavailable instead of substituting an empty in-memory store', async () => {
+    const dir = await tempDir()
+    try {
+      // A plain file where the chunk-store directory must go makes the open fail
+      // AFTER the domain facility has already succeeded. Degrading to memory
+      // here would show an empty library while the data is intact on disk.
+      const blocker = join(dir, 'not-a-directory')
+      await writeFile(blocker, 'x', 'utf8')
+      const facility = { open: async () => fakeDomain() } as unknown as StorageDomainFacility
+      await expect(openStore(facility, { chunkStorePath: join(blocker, 'chunks.sqlite') }))
+        .rejects.toBeInstanceOf(StorageUnavailableError)
+
+      // The documented degradation still applies when there is no backend at all.
+      const memory = await openStore(undefined)
+      expect(memory.listBases()).toHaveLength(0)
+      await memory.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
