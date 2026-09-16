@@ -95,6 +95,10 @@ async function handleRequest(service: KnowledgeService, req: IncomingMessage, re
       writeJson(res, 503, { ok: false, error: { code: 'storage_unavailable', message: error.message } })
       return
     }
+    if (error instanceof InvalidRequestError) {
+      writeJson(res, 400, { ok: false, error: { code: 'invalid_request', message: error.message } })
+      return
+    }
     const message = error instanceof Error ? error.message : String(error)
     writeJson(res, 500, { ok: false, error: { code: 'error', message } })
   }
@@ -281,7 +285,15 @@ async function route(
   if (segments[0] === 'bases') {
     if (segments.length === 1) {
       if (method === 'GET') return service.listBases()
-      if (method === 'POST') return service.createBase(body as unknown as CreateBaseRequest)
+      if (method === 'POST') {
+        // Validate the two fields the service dereferences immediately: without
+        // this, `{}` produced an internal `Cannot read properties of undefined`
+        // TypeError reported as a 500 server fault.
+        if (typeof body.name !== 'string' || body.name.trim() === '') {
+          throw new InvalidRequestError('createBase requires a non-empty "name"')
+        }
+        return service.createBase(body as unknown as CreateBaseRequest)
+      }
       return undefined
     }
     const baseId = segments[1]
@@ -295,8 +307,11 @@ async function route(
       if (segments[2] === 'reindex' && method === 'POST') return service.startReindexBase(baseId)
       if (segments[2] === 'files-batch' && method === 'POST') {
         const bodyRequest = body as Partial<AddFilesRequest>
+        // A malformed body is a client mistake, not a missing endpoint: returning
+        // `undefined` here fell through to the "no route" 404, which sends the
+        // caller looking for the wrong problem.
         if (!Array.isArray(bodyRequest.files)) {
-          return undefined
+          throw new InvalidRequestError('files-batch requires a "files" array')
         }
         return service.addFiles({
           baseId,
@@ -426,22 +441,38 @@ async function route(
 
   // /search
   if (segments[0] === 'search' && method === 'POST') {
+    // `request.query.trim()` is the service's first statement; an absent query
+    // used to surface as an internal TypeError reported as a 500.
+    if (typeof body.query !== 'string' || body.query.trim() === '') {
+      throw new InvalidRequestError('search requires a non-empty "query"')
+    }
     return service.search(body as unknown as SearchRequest)
   }
 
   return undefined
 }
 
+/** A client mistake: a malformed body, a bad content type, an id-less batch. It
+ *  is mapped to 400 so a caller's error is not reported as a server fault (and
+ *  does not count as a 5xx in monitoring). */
+export class InvalidRequestError extends Error {
+  readonly code = 'invalid_request'
+  constructor(message: string) {
+    super(message)
+    this.name = 'InvalidRequestError'
+  }
+}
+
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const mediaType = (req.headers['content-type'] ?? '').split(';', 1)[0]?.trim().toLowerCase()
   if (mediaType === '') return {}
-  if (mediaType !== 'application/json') throw new Error('content type must be application/json')
+  if (mediaType !== 'application/json') throw new InvalidRequestError('content type must be application/json')
   const text = await readBody(req)
   if (text.trim().length === 0) return {}
   try {
     return JSON.parse(text) as Record<string, unknown>
   } catch {
-    throw new Error('body is not valid JSON')
+    throw new InvalidRequestError('body is not valid JSON')
   }
 }
 
@@ -451,7 +482,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
   for await (const chunk of req) {
     const buffer = chunk as Buffer
     size += buffer.byteLength
-    if (size > MAX_BODY_BYTES) throw new Error('request body too large')
+    if (size > MAX_BODY_BYTES) throw new InvalidRequestError('request body too large')
     chunks.push(buffer)
   }
   return Buffer.concat(chunks).toString('utf8')

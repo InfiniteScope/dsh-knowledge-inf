@@ -1174,10 +1174,13 @@ export class KnowledgeService extends Service {
       .filter(item => item.action === 'failed' && item.error !== undefined)
       .map(item => ({ file: item.relativePath, error: item.error!.message }))
     return {
-      // Keep the pre-4.0 fields stable: `imported` has always meant files,
-      // while `directories` includes the root on an initial import.
-      imported: sync.items.filter(item => item.kind === 'file' && item.action === 'created').length,
-      directories: sync.items.filter(item => item.kind === 'directory' && item.action === 'created').length,
+      // `imported`/`directories` keep their pre-4.0 meaning of "items this call
+      // wrote", i.e. created PLUS updated. Counting only `created` made a
+      // re-sync that re-parsed and re-embedded every changed file report
+      // `imported: 0` — success-shaped zeros for real work. The split lives in
+      // `sync` for callers that need it.
+      imported: sync.items.filter(item => item.kind === 'file' && (item.action === 'created' || item.action === 'updated')).length,
+      directories: sync.items.filter(item => item.kind === 'directory' && (item.action === 'created' || item.action === 'updated')).length,
       errors,
       sourceId: prepared.root.id,
       mode: prepared.mode,
@@ -1387,7 +1390,27 @@ export class KnowledgeService extends Service {
     }
     if (source.sourceType === 'directory') {
       if (!st.isDirectory()) throw new Error('a directory source must be repointed to a directory')
-      await store.putDocument({ ...source, sourcePath: await this.canonicalSourcePath(trimmed), updatedAt: Date.now() })
+      const canonical = await this.canonicalSourcePath(trimmed)
+      // Repointing must respect the same one-source-one-path invariant that
+      // prepareDirectoryImport enforces. Without this check a repoint onto a path
+      // another root already owns left TWO trees bound to one directory: the next
+      // import then fails closed with `ambiguous_source` for both, and a rescan of
+      // the repointed root matches no child by path, so every file is re-created
+      // and rejected as a duplicate — a `partial` sync whose items are all failed.
+      const conflict = store.listDocuments(baseId).find(document =>
+        document.id !== source.id
+        && document.sourceType === 'directory'
+        && document.sourcePath !== undefined
+        && this.sameSourcePath(document.sourcePath, canonical),
+      )
+      if (conflict !== undefined) {
+        throw new DirectorySourceError(
+          'source_path_conflict',
+          'another directory source in this knowledge base is already bound to that path',
+          { sourcePath: canonical, sourceId: conflict.id },
+        )
+      }
+      await store.putDocument({ ...source, sourcePath: canonical, updatedAt: Date.now() })
     } else {
       if (!st.isFile()) throw new Error('a file source must be repointed to a file')
       const nextFileName = basename(trimmed)
@@ -2083,25 +2106,58 @@ export class KnowledgeService extends Service {
     }
   }
 
-  async reindexBase(baseId: string): Promise<{ reindexed: number }> {
+  /** Reindex a whole base synchronously. Collects per-root failures instead of
+   *  aborting the sweep: one unreadable source (a moved folder, an unmounted
+   *  drive) must not stop the remaining documents, exactly as the background job
+   *  and the bulk endpoint already behave. */
+  async reindexBase(baseId: string): Promise<{ reindexed: number; skipped: number; failed: number; items: DirectorySyncItem[] }> {
     const store = this.requireStore()
+    if (store.getBase(baseId) === undefined) throw new Error(`knowledge base not found: ${baseId}`)
     const ids = store.listDocuments(baseId).map(doc => doc.id)
     // Fold to outermost roots: a directory reindexes its subtree recursively,
     // so its descendants must not be reindexed a second time as siblings.
     let reindexed = 0
+    let skipped = 0
+    let failed = 0
+    const items: DirectorySyncItem[] = []
     for (const id of this.outermostSelectedIds(ids)) {
       // In-flight documents are skipped (Cherry's REINDEX_ALLOWED_STATUSES),
       // never failed: a base reindex triggered while an import is running must
       // not abort the whole sweep because one row is busy.
-      if (this.indexing.has(id)) continue
-      await this.reindexDocument(id)
-      reindexed += 1
+      if (this.indexing.has(id)) {
+        skipped += 1
+        continue
+      }
+      try {
+        const result = await this.reindexDocument(id)
+        reindexed += 1
+        if (result.sync !== undefined) {
+          items.push(...result.sync.items)
+          failed += result.sync.failed
+        }
+      } catch (error) {
+        failed += 1
+        const document = store.getDocument(id)
+        items.push({
+          relativePath: document?.title ?? id,
+          kind: document?.sourceType === 'directory' ? 'directory' : 'file',
+          documentId: id,
+          action: 'failed',
+          error: this.directoryItemError(error),
+        })
+      }
     }
-    return { reindexed }
+    return { reindexed, skipped, failed, items }
   }
 
-  /** Start re-embedding a whole base as a cancellable background job. */
-  async startReindexBase(baseId: string): Promise<{ jobId: string; total: number }> {
+  /** Start re-embedding a whole base as a cancellable background job.
+   *
+   *  `total` counts the folded SOURCE ROOTS the job walks, which is the same unit
+   *  as `imported`, so `imported / total` stays meaningful. `documentTotal` is the
+   *  size of the base in documents, because a client that compares the job's
+   *  total with its document count would otherwise read one directory holding 200
+   *  files as a single unit of work. */
+  async startReindexBase(baseId: string): Promise<{ jobId: string; total: number; documentTotal: number }> {
     const store = this.requireStore()
     if (store.getBase(baseId) === undefined) throw new Error(`knowledge base not found: ${baseId}`)
     const documents = store.listDocuments(baseId)
@@ -2120,7 +2176,7 @@ export class KnowledgeService extends Service {
       done: false,
     })
     void this.runReindexJob(jobId, baseId)
-    return { jobId, total: roots.length }
+    return { jobId, total: roots.length, documentTotal: documents.length }
   }
 
   /** Progress snapshot of an active (or just-finished) reindex job. */
@@ -2203,25 +2259,38 @@ export class KnowledgeService extends Service {
     return { reindexed, skipped, failed, items }
   }
 
-  async deleteDocuments(ids: readonly string[], options?: { recursive?: boolean }): Promise<{ deleted: number }> {
+  /** Delete a selection (folded to its outermost roots).
+   *
+   *  `deleted` is the number of DOCUMENTS removed, including the descendants of
+   *  a selected directory — the meaning it had before 4.0 folded the selection.
+   *  Counting folded roots instead made the confirmation ("delete these N rows")
+   *  and the result ("deleted: 1" for a directory holding 200 files) describe the
+   *  same action with different numbers. `roots` carries the folded count. */
+  async deleteDocuments(ids: readonly string[], options?: { recursive?: boolean }): Promise<{ deleted: number; roots: number }> {
     const store = this.requireStore()
+    if (ids.length === 0) throw new Error('no documents selected')
     // Fold to outermost roots so a directory and its selected descendants are
     // not deleted twice. Preflight *all* roots before the first delete so a
     // missing recursive confirmation can never produce a partial batch write.
     const roots = this.assertDeleteImpacts(ids, options?.recursive === true)
     const touched = new Set<string>()
     let deleted = 0
+    let removedRoots = 0
     for (const id of roots) {
       const document = store.getDocument(id)
       if (document === undefined) continue
+      // The preflight already walked each subtree; reuse it so the reported count
+      // matches what the confirmation showed.
+      const impact = this.getDeleteImpact(id)
+      deleted += impact.directories + impact.files
       await this.deleteDocumentRecursive(id)
       touched.add(document.baseId)
-      deleted += 1
+      removedRoots += 1
     }
     // One updatedAt write per affected base, not per document.
     for (const baseId of touched) await this.touchBase(baseId)
     await this.reconcileAfterDelete()
-    return { deleted }
+    return { deleted, roots: removedRoots }
   }
 
   /**

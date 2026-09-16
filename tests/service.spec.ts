@@ -918,7 +918,12 @@ describe('KnowledgeService', () => {
     // Selecting the directory AND one of its descendants folds to the root:
     // the subtree is deleted once, everything below it goes with it.
     const deleted = await service.deleteDocuments([root.id, leaf.id, top.id], { recursive: true })
-    expect(deleted.deleted).toBe(2) // root (with subtree) + top
+    // `deleted` counts DOCUMENTS removed (the whole root subtree: root, child,
+    // leaf — plus top), while `roots` reports how many folded selections did the
+    // work. Reporting only the folded count made the confirmation dialog ("delete
+    // these 3 rows") and the result disagree about the same action.
+    expect(deleted.deleted).toBe(4)
+    expect(deleted.roots).toBe(2)
     expect(service.listDocuments(base.id)).toHaveLength(0)
   })
 
