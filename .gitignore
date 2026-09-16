@@ -12,3 +12,8 @@ scripts/eval-*.json
 # Tesseract language data: downloaded on demand by the OCR fallback, never part of
 # the project. A stray download put 7MB of it in the repository root once.
 *.traineddata
+# Issue responses and other per-report working notes stay local: they are written
+# for a reporter, not for the published repository. Durable findings belong in
+# CHANGELOG.md or docs/releases/, and the deferred list in docs/. The pattern is
+# ignored rather than merely untracked so a later `git add -A` cannot pick it up.
+docs/issues/
