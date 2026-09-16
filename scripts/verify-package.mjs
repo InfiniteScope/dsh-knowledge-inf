@@ -3,7 +3,7 @@
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const REQUIRED_FILES = [
@@ -36,8 +36,13 @@ function executable(name) {
   return process.platform === 'win32' ? `${name}.cmd` : name
 }
 
+/** `pack` is an npm surface: pnpm rejects `--ignore-scripts` and `--cache`, so a
+ *  process started from a pnpm lifecycle script (`pnpm run verify:package`)
+ *  cannot reuse its `npm_execpath`. Fall back to the real npm CLI there instead
+ *  of failing the gate with "Unknown options" after the whole suite has run. */
 function npmInvocation(args) {
-  if (process.env.npm_execpath !== undefined) return [process.execPath, [process.env.npm_execpath, ...args]]
+  const execpath = process.env.npm_execpath
+  if (execpath !== undefined && !/^pnpm/i.test(basename(execpath))) return [process.execPath, [execpath, ...args]]
   return [executable('npm'), args]
 }
 
