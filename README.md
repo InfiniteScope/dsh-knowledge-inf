@@ -78,7 +78,7 @@ dsh plugin --profile <name> add dsh-knowledge
 
 ```bash
 # GitHub Release 或 npm pack 生成的 tarball
-dsh plugin --profile <name> add ./dsh-knowledge-4.0.0.tgz
+dsh plugin --profile <name> add ./dsh-knowledge-0.4.0.tgz
 
 # 本地源码目录，需要先完成构建
 dsh plugin --profile <name> add file:/path/to/dsh-knowledge
@@ -228,7 +228,7 @@ allowBuilds:
 
 ---
 
-## v4.0.0 更新重点
+## v0.4.0 更新重点
 
 - 目录来源以“知识库 + 规范化真实路径”确定身份：再次导入同一目录会原地同步原树，不再新建第二棵树。
 - 首次导入、重复导入、单文件重建和整库后台重建统一走同一套同步引擎，逐项返回新建 / 更新 / 未变化 / 删除 / 失败。未变化不再算失败，部分失败返回 `partial` 并保留已完成的同步。
@@ -239,7 +239,7 @@ allowBuilds:
 
 本次升级不迁移数据库、不自动重建索引、不清理历史目录、不重新下载模型，也不改变既有字段与调用签名；新增的同步结果、`sourcePath`、删除影响预检与 `recursive` 参数均为加法接口。唯一收紧的是：非空目录不再允许被静默级联删除。
 
-[查看 v4.0.0 GitHub Release](https://github.com/Soren-ABT/dsh-knowledge/releases/tag/v4.0.0) · [查看 CHANGELOG](./CHANGELOG.md)
+[查看 v0.4.0 GitHub Release](https://github.com/Soren-ABT/dsh-knowledge/releases/tag/v0.4.0) · [查看 CHANGELOG](./CHANGELOG.md)
 
 ---
 

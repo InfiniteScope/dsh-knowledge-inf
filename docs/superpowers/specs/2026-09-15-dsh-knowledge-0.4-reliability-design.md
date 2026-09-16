@@ -1,11 +1,11 @@
-# dsh-knowledge 4.0.0 reliability design
+# dsh-knowledge 0.4.0 reliability design
 
 **Date:** 2026-09-15
 **Status:** Approved design; implementation has not started
 
 ## Purpose
 
-Deliver a single, compatibility-preserving 4.0.0 release that includes the
+Deliver a single, compatibility-preserving 0.4.0 release that includes the
 already-merged retrieval and local-model lifecycle work for Issues #16–#18,
 and resolves the remaining data-integrity problems reported in Issue #20:
 
@@ -26,7 +26,7 @@ is loaded.
 
 ## Compatibility contract
 
-4.0.0 is a major release for reliability and release discipline, not a
+0.4.0 is a reliability release and a release-discipline milestone, not a
 destructive data-format rewrite.
 
 - A 0.3.9 data directory starts without a database migration, re-embedding, or
@@ -64,7 +64,7 @@ place and is not sufficient for a reliability release.
 
 This would require choosing an owner for raw snapshots, manually organized
 nodes, and potentially conflicting descendants. It risks user data loss, so
-4.0.0 deliberately does not perform it.
+0.4.0 deliberately does not perform it.
 
 ## Architecture
 
@@ -184,7 +184,7 @@ zero writes. Batch deletion preflights every selection before deleting any
 item. Ordinary files and empty directories retain their one-step deletion
 flow.
 
-## Included 4.0.0 work
+## Included 0.4.0 work
 
 - Issue #16: report actual retrieval lanes and final score meaning.
 - Issue #17: isolate local embedding in a recoverable child process with strict
@@ -222,7 +222,7 @@ flow.
   and 26.
 
 Only after all gates pass will the package version, changelog, generated `lib`,
-release notes, and `v4.0.0` tag be prepared. GitHub Release and `npm publish`
+release notes, and `v0.4.0` tag be prepared. GitHub Release and `npm publish`
 require a final explicit maintainer confirmation and are not automatic.
 
 ## Non-goals

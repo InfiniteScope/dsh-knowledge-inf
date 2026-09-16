@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.0.0 — 2026-09-15
+## 0.4.0 — 2026-09-15
 
 ### One directory source, one sync path (issue #20)
 

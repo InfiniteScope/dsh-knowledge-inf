@@ -1,6 +1,6 @@
-# Deferred audit findings (4.0.0)
+# Deferred audit findings (0.4.0)
 
-The 4.0.0 reliability audit was closed in `41c1c67` plus the documentation batch that
+The 0.4.0 reliability audit was closed in `41c1c67` plus the documentation batch that
 follows it. Everything the audit classified as critical or high was fixed in that
 range. This file records what was deliberately **not** fixed, so a later release can
 pick it up without re-deriving it, and so the record does not claim more than was

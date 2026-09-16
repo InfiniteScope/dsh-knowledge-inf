@@ -76,7 +76,7 @@ Lexical retrieval works without downloading a model. Scanned-document OCR, local
 
 ```bash
 # Tarball from GitHub Releases or npm pack
-dsh plugin --profile <name> add ./dsh-knowledge-4.0.0.tgz
+dsh plugin --profile <name> add ./dsh-knowledge-0.4.0.tgz
 
 # Local source directory; build it first
 dsh plugin --profile <name> add file:/path/to/dsh-knowledge
@@ -226,7 +226,7 @@ The plugin exposes 14 tools. Reads, writes, and proactive retrieval all obey the
 
 ---
 
-## v4.0.0 highlights
+## v0.4.0 highlights
 
 - A directory source is identified by its base plus its canonical real path, so re-importing the same directory synchronizes the original tree in place instead of building a second root.
 - The first import, a repeat import, a single-file reindex, and the base-wide background reindex now share one sync engine. Each item reports created / updated / unchanged / deleted / failed; unchanged is never a failure, and a partly failed sync returns `partial` while keeping the work that succeeded.
@@ -237,7 +237,7 @@ The plugin exposes 14 tools. Reads, writes, and proactive retrieval all obey the
 
 The upgrade requires no database migration, automatic reindex, legacy directory cleanup, or model redownload and does not change existing fields or call signatures. The sync report, `sourcePath`, the delete-impact preview, and the `recursive` argument are additive. The one deliberate tightening is that a non-empty directory can no longer be deleted silently.
 
-[Read the v4.0.0 GitHub Release](https://github.com/Soren-ABT/dsh-knowledge/releases/tag/v4.0.0) · [Read the changelog](./CHANGELOG.md)
+[Read the v0.4.0 GitHub Release](https://github.com/Soren-ABT/dsh-knowledge/releases/tag/v0.4.0) · [Read the changelog](./CHANGELOG.md)
 
 ---
 

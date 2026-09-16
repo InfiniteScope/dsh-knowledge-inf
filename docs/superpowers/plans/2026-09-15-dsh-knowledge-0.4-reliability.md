@@ -1,11 +1,11 @@
-# dsh-knowledge v4.0.0 Reliability Release Implementation Plan
+# dsh-knowledge v0.4.0 Reliability Release Implementation Plan
 
 ## Scope
 
 Implement the directory-source identity and synchronization work specified in
-`docs/superpowers/specs/2026-09-15-dsh-knowledge-4.0-reliability-design.md`
+`docs/superpowers/specs/2026-09-15-dsh-knowledge-0.4-reliability-design.md`
 (issue #20), fold in the completed #16–#18 fixes and the #22 installation
-recovery documentation, and prepare the v4.0.0 release.
+recovery documentation, and prepare the v0.4.0 release.
 
 Ordering note: the host synchronization engine and the panel confirmation were
 implemented before this plan was written, because the earlier session was
@@ -30,8 +30,8 @@ clean typecheck and the full test suite before it was created.
    and require a second confirmation that names the exact scope. Commit as
    `feat(ui): confirm cascading deletes with the host-reported impact`.
 5. Merge `docs/install-recovery-guidance` (#22) into the release branch.
-6. Update `package.json` and `dsh.plugin.json` to `4.0.0`; add the 2026-09-15
-   section at the top of `CHANGELOG.md`; create `docs/releases/v4.0.0.md`;
+6. Update `package.json` and `dsh.plugin.json` to `0.4.0`; add the 2026-09-15
+   section at the top of `CHANGELOG.md`; create `docs/releases/v0.4.0.md`;
    update both READMEs' installation example and current-release highlights
    without rewriting the v0.3.9 historical notes.
 7. Run `npm run release:check` from a clean committed tree: build policy
@@ -39,17 +39,17 @@ clean typecheck and the full test suite before it was created.
    the full Vitest suite, the retrieval benchmark, the deterministic build, and
    package verification.
 8. Confirm the npm tarball metadata and that required files include the
-   v4.0.0 release note and every runtime worker.
+   v0.4.0 release note and every runtime worker.
 9. Push the branch, identify the CI run for the exact release commit, and wait
    for the required jobs: quality CI on Node 22.19, 24, and 26, and native CI
    on Ubuntu, Windows, and macOS. Run the real local embedding and local rerank
    smoke jobs, treating a deliberately skipped manual job as allowed.
-10. Create annotated tag `v4.0.0` on the verified release commit and push it.
-11. Create a GitHub Release Draft from `docs/releases/v4.0.0.md` and report the
+10. Create annotated tag `v0.4.0` on the verified release commit and push it.
+11. Create a GitHub Release Draft from `docs/releases/v0.4.0.md` and report the
     exact npm command and verified tarball metadata to the maintainer. Do not
     invoke `npm publish`.
 12. After the maintainer reports publication, verify
-    `npm view dsh-knowledge version` equals `4.0.0`, then publish the GitHub
+    `npm view dsh-knowledge version` equals `0.4.0`, then publish the GitHub
     Release draft.
 
 ## Verification for the acceptance criteria
@@ -70,7 +70,7 @@ clean typecheck and the full test suite before it was created.
 ## Stop conditions
 
 - Stop before tagging if any local release gate or required GitHub CI job fails.
-- Stop before publishing the GitHub Release if npm does not report 4.0.0.
+- Stop before publishing the GitHub Release if npm does not report 0.4.0.
 - Stop and request direction before changing a pushed release tag, and never
   merge, move, or delete a user's historical duplicate directory tree
   automatically.
