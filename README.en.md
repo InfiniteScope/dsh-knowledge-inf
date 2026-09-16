@@ -135,6 +135,8 @@ Directory imports recursively scan `txt`, `md`, `csv`, `html`, `json`, `pdf`, `d
 
 A directory rescan imports new files, rebuilds changed files, and removes files that disappeared from disk. One failed item does not obscure successful imports; the service and UI retain per-file errors.
 
+**How to update an already-imported directory**: import the same path again, or rescan the directory container in the panel. Both now take the same synchronization path and update the original tree in place. A directory source is identified by its knowledge base plus its resolved real path, so a repeat import never builds a second tree. Files inside it are identified by that source plus their relative path; a legacy file is adopted only when its name and kind are unique, and two candidates are reported as `ambiguous_source` rather than guessed, merged, or deleted. Administrative document details return the container's `sourcePath`, so a client can tell which container to rescan.
+
 </details>
 
 ### Retrieval and evidence flow

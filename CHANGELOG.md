@@ -17,20 +17,53 @@
 
 ### Local model lifecycle and retrieval status (issues #16–#18)
 
-- Isolated local embedding and rerank workers recover from a crashed or interrupted runtime instead of failing permanently.
-- Rerank readiness is finalized after normal inference, and retrieval reports the status of each lane so a degraded lane is visible rather than silent.
+- **Retrieval reports the lanes that ran** (issue #16). `mode` is derived from which lanes executed, not from whether one result row happened to carry both scores — RRF legitimately admits single-lane rows, so a search whose vector lane contributed used to report `mode: "lexical"`. Lane-level `attempted`/`succeeded`/`returnedCount` and a `scoreKind` naming what the scores mean are both returned. The row-derived fallback is gone rather than kept as a default.
+- **Rerank readiness reflects the model, not a flag** (issue #18). A routine model load no longer publishes `validating` (that masqueraded as a verification and re-armed the gate's veto for concurrent searches), child teardown clears the status it owned, and a flag whose owner is gone expires instead of vetoing every later search — which was self-locking, because the gate refused the very request that would have posted `ready`. A gate refusal now reports the new `skipped` status with no elapsed time instead of `degraded` with `attempted: false`, and a cold child gets an explicit load allowance so its model load is not charged to the query's inference budget.
+- **A broken local model no longer requires restarting DSH** (issue #17). A failure the child reports about itself now replaces that child, so the automatic retry is a real restart rather than a no-op inside the same poisoned process; a truncated or unloadable cache is quarantined and re-downloaded instead of being reported as present forever.
+- **Download integrity and cancel semantics.** Weights completeness is judged against the byte size the downloader itself reported, not "a non-empty `.onnx` exists". Cancelling a download stops only an in-flight transfer — it never deletes a complete, validated model — and a download is not tied to the HTTP request that started it, so a client disconnect does not cancel it. The request budget is re-armed by progress, so a slow link is bounded by a stall rather than by total transfer time.
+
+### Data integrity
+
+- **A completed import no longer keeps its crash marker.** The pre-embedding write marks a document resumable; the completing write used to spread that record back, so every imported document stayed marked and startup recovery treated the whole library as interrupted — re-parsing and re-embedding it on the next start with auto-resume on, and re-marking every document failed on every start with auto-resume off. The decision not to resume now also clears the marker.
+- **Chunk rows left by a delete are reconciled.** A batch that landed after its document row was deleted kept matching lexical and vector search (the lanes scope by base, not by document existence); startup and every delete now remove them, and the mid-embedding guard deletes the rows it already wrote.
+
+### Storage resilience
+
+- **A storage failure is reported, not hidden.** `openStore` fell back to an in-memory store on ANY failure, including one after the SQLite file and the domain were already open: the user saw an EMPTY library while the data sat intact on disk, every write that session was lost on restart, and both handles leaked. Only an absent backend falls back now; anything else closes what it opened and throws `StorageUnavailableError`, which the HTTP layer answers as `503 storage_unavailable`.
+- **Deletes are durable before they report success** — the store dropped the batched, yielding delete's promise, so a document row could be gone while its chunks were still there.
+- **The FTS migration is transactional and guarded by a marker** rather than by schema text. An interruption between `CREATE VIRTUAL TABLE` and `rebuild` used to leave an empty index that the textual guard accepted, skipping the rebuild forever and silently emptying the lexical lane for all pre-existing content. (FTS5's own `integrity-check` cannot detect that state: measured, it accepts an empty index on an external-content table.)
+- Space reclamation is best-effort as documented (a failing checkpoint or `VACUUM` used to turn a successful delete into a reported failure), the legacy JSON migration resumes per document instead of skipping wholesale, concurrent settings writes no longer clobber each other, and the per-base vector cache is invalidated by `PRAGMA data_version` so another connection's commits are visible.
+
+### Security
+
+- **IPv6 hosts no longer bypass the URL-import guard.** The deny-list held bracketed literals (`[::1]`, `[::]`) while the lookup stripped the brackets first, so those entries could never match and NO IPv6 form was rejected — including `http://[::ffff:127.0.0.1]:11434/`. Literal addresses are classified with `isIP` now, covering loopback, unspecified, unique-local, link-local and multicast IPv6, IPv4-mapped forms in both notations, and the CGNAT, benchmarking, multicast and reserved IPv4 ranges.
+- **Private evaluation sets cannot ship.** The template told users to put their real question set in `scripts/`, which is published; the same leak is recorded for 0.2.12. Sets live in the git-ignored `eval/` directory now, and `verify-package` rejects a non-example set in the tarball.
+
+### Truthful reporting in the API and the panel
+
+- Directory imports and rescans report the real diff. `imported` counts created **and** updated items, so a re-sync that re-parsed every changed file no longer answers `imported: 0`; the panel shows created/updated/deleted/unchanged/failed and says "no changes detected" instead of "0 documents", and names the first failure when a sync is only partly successful.
+- A batch delete reports the documents actually removed (the confirmation dialog and the result used to describe the same action with different numbers — one directory holding 200 files was confirmed as N and reported as 1).
+- `reindexBase` collects per-root failures instead of aborting the whole sweep on one unreadable source, the reindex job exposes the base size alongside its root count, and repointing a directory source refuses a path another root already owns.
+- Client mistakes answer 400 rather than 500 (and a malformed body no longer answers 404 "no route"), an import whose every attempt failed reports the engine's reason instead of telling the user to download models they already have, and OCR work is bounded by a 15-minute budget and a cumulative raster cap on the render path as well as the fallback.
+
+### Panel behaviour
+
+- The local-models poll no longer erases action messages (it cleared the shared slot every second, so a failed download showed no reason), success text is no longer styled as an error, clearing a numeric field no longer saves an invalid `0`, a failed rename/create can be retried without closing the dialog, file-import failures always surface, adding a note refreshes the list, and the directory-import toast no longer claims success next to an error.
+
+### Compatibility and quality
+
+- The release is additive and migration-free: 0.3.9 data directories start without a database migration, re-embedding, forced reindex, legacy directory cleanup, or model download. Existing fields and call signatures keep working; the sync result, `sourcePath` accessor, delete-impact preview, `recursive` argument, per-lane retrieval status, `scoreKind`, and the `skipped` rerank status are additions. The one deliberate tightening is that a non-empty directory can no longer be deleted silently.
+- Installing and recovering a DSH profile is documented in both READMEs (issue #22).
+- **Every emitted companion bundle is now executed by a gate.** The embed, rerank and OCR child implementations exist only as build artifacts, and the suites that appeared to cover them replaced `node:child_process` wholesale, so nothing ran them. `npm run smoke:workers` forks or loads each bundle and requires a real protocol exchange; it runs in the quality job, on every native platform, and in the release preflight.
+- The suite pins vitest's `forks` pool. The `threads` pool was measured to crash whole runs with an access violation (2 of 4) because this suite loads native addons; forks passed 6 of 6 and is what CI runs.
+- When the durable backend exists but cannot be opened, the failure is reported instead of an empty library (`503 storage_unavailable`).
+- Full typecheck, the complete Vitest suite, the deterministic build, package verification, production audit policy, and the retrieval benchmark are part of the release preflight; cross-platform CI and the real local embedding/rerank smoke run before the tag.
 
 ### PDF parsing can no longer leak a host-level rejection
 
 - `pdf-parse` v1 bundles pdf.js v1.10, whose failure path leaks an unhandled rejection: `getDocument` throws before the library's local `doc` is ever assigned, so its unawaited `doc.destroy()` never runs and the half-built worker leaves a promise rejecting with nobody attached. Node 22 escalates that stray rejection to a process-level unhandled rejection, so importing a scanned or corrupt PDF reported an unhandled error in the host process — and failed CI on Node 22.19 while every assertion still passed.
 - pdf-parse now runs in its own worker thread, the same containment the OCR worker already uses for Tesseract.js and the embed/rerank processes use for onnxruntime. The stray rejection is recorded in that thread with a bounded, prefixed message and never reaches the host; the caller still receives a clean parse failure and falls through to pdfjs-dist layout extraction, OCR, and anydoc exactly as before.
 - A per-request ceiling means a PDF the engine cannot finish reports a clear failure instead of pinning an import indefinitely, and an install missing the worker bundle logs one warning and parses in-process rather than hanging.
-
-### Compatibility and quality
-
-- The release is additive and migration-free: 0.3.9 data directories start without a database migration, re-embedding, forced reindex, legacy directory cleanup, or model download. Existing fields and call signatures keep working; the sync result, `sourcePath` accessor, delete-impact preview, and `recursive` argument are additions.
-- Installing and recovering a DSH profile is documented in both READMEs (issue #22).
-- Full typecheck, the complete Vitest suite, the deterministic build, package verification, production audit policy, and the retrieval benchmark are part of the release preflight; cross-platform CI and the real local embedding/rerank smoke run before the tag.
 
 ## 0.3.9 — 2026-09-02
 

@@ -9,3 +9,6 @@ coverage/
 eval/
 scripts/eval-*.json
 !scripts/eval-*.example.json
+# Tesseract language data: downloaded on demand by the OCR fallback, never part of
+# the project. A stray download put 7MB of it in the repository root once.
+*.traineddata
