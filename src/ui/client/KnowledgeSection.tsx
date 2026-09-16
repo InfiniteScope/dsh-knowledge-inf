@@ -18,6 +18,7 @@ import type {
   BaseSummary,
   ChunkView,
   DeleteImpact,
+  DirectorySyncResult,
   DocumentSummary,
   KnowledgeConfig,
   LocalModelStatus,
@@ -553,6 +554,30 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
     setDialog({ kind: 'addPath' })
   }, [selectedBaseId])
 
+  /** Report a directory sync truthfully. A re-import of an unchanged directory
+   *  has nothing to create, so presenting only the created count told the user
+   *  "0 documents" for a sync that confirmed every file — and a sync with per-file
+   *  failures presented the successes as an overall success. */
+  const notifySync = useCallback((label: string, sync: DirectorySyncResult): void => {
+    const parts: string[] = []
+    if (sync.created > 0) parts.push(`${t('syncCreated')} ${sync.created}`)
+    if (sync.updated > 0) parts.push(`${t('syncUpdated')} ${sync.updated}`)
+    if (sync.deleted > 0) parts.push(`${t('syncDeleted')} ${sync.deleted}`)
+    if (sync.unchanged > 0) parts.push(`${t('syncUnchanged')} ${sync.unchanged}`)
+    if (sync.failed > 0) parts.push(`${t('syncFailed')} ${sync.failed}`)
+    const summary = parts.join(' · ')
+    if (sync.failed > 0) {
+      const first = sync.items.find(item => item.action === 'failed' && item.error !== undefined)
+      notify('warning', `${label} · ${summary}${first?.error !== undefined ? ` — ${first.relativePath}: ${first.error.message}` : ''}`)
+      return
+    }
+    if (sync.created + sync.updated + sync.deleted === 0) {
+      notify('info', `${label} · ${t('syncNoChanges')}${sync.unchanged > 0 ? ` (${t('syncUnchanged')} ${sync.unchanged})` : ''}`)
+      return
+    }
+    notify('success', `${label} · ${summary}`)
+  }, [notify, t])
+
   const addPath = useCallback((path: string): void => {
     if (selectedBaseId === null) return
     const trimmed = path.trim()
@@ -561,12 +586,14 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
       try {
         const result = await api.importFromPath(selectedBaseId, trimmed)
         setDialog(null)
-        if (result.errors.length > 0) {
+        if (result.sync !== undefined) {
+          notifySync(t('tabPath'), result.sync)
+        } else if (result.errors.length > 0) {
           notify('warning', t('pathImportPartial')
             .replace('{count}', String(result.imported))
             .replace('{errors}', String(result.errors.length)))
         } else {
-          notify('success', `${t('tabPath')}: ${result.kind === 'directory' ? `${result.imported} ${t('docCount')}` : result.imported}`)
+          notify('success', `${t('tabPath')}: ${result.imported}`)
         }
         await refreshBases()
         await reloadDocuments()
@@ -574,7 +601,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
         notify('error', err instanceof Error ? err.message : String(err))
       }
     })
-  }, [api, run, refreshBases, reloadDocuments, notify, selectedBaseId, t])
+  }, [api, run, refreshBases, reloadDocuments, notify, notifySync, selectedBaseId, t])
 
   const promptForSourcePath = useCallback((source: BaseSourceInfo): void => {
     if (selectedBaseId === null) return
@@ -927,8 +954,11 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
     // reindex job reports progress continuously).
     setPollKick(kick => kick + 1)
     await run(async () => {
-      await api.reindexDocument(doc.id)
-      notify('success', `${t('reindexDone')}: ${doc.title}`)
+      const result = await api.reindexDocument(doc.id)
+      // A directory rescan reports per-file outcomes: without them a rescan whose
+      // files all failed still showed the green "reindexed" toast (issue #20).
+      if (result.sync !== undefined) notifySync(`${t('reindexDone')}: ${doc.title}`, result.sync)
+      else notify('success', `${t('reindexDone')}: ${doc.title}`)
       await reloadDocuments()
     })
     setOptimisticProcessing(prev => {
@@ -936,7 +966,7 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
       for (const id of optimisticIds) next.delete(id)
       return next
     })
-  }, [api, run, reloadDocuments, notify, t, collectSubtreeIds])
+  }, [api, run, reloadDocuments, notify, notifySync, t, collectSubtreeIds])
 
   const refreshUrlDoc = useCallback(async (doc: DocumentSummary): Promise<void> => {
     await run(async () => {
@@ -983,7 +1013,15 @@ function PanelBody(props: { api: KnowledgeApi; t: Translate; onClose: () => void
     await run(async () => {
       const result = await api.reindexDocuments(reindexable.map(doc => doc.id))
       const totalSkipped = skipped + (result.skipped ?? 0)
-      notify('success', `${t('reindexDone')} ${result.reindexed}${totalSkipped > 0 ? ` · ${t('bulkReindexSkipped')} ${totalSkipped}` : ''}`)
+      const failed = result.failed ?? 0
+      const summary = `${t('reindexDone')} ${result.reindexed}${totalSkipped > 0 ? ` · ${t('bulkReindexSkipped')} ${totalSkipped}` : ''}${failed > 0 ? ` · ${t('syncFailed')} ${failed}` : ''}`
+      // A batch with failures must not report plain success (issue #20).
+      if (failed > 0) {
+        const first = result.items.find(item => item.action === 'failed' && item.error !== undefined)
+        notify('warning', `${summary}${first?.error !== undefined ? ` — ${first.relativePath}: ${first.error.message}` : ''}`)
+      } else {
+        notify('success', summary)
+      }
       setCheckedDocIds(new Set())
       await reloadDocuments()
     })

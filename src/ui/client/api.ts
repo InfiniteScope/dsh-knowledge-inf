@@ -73,6 +73,27 @@ export interface BaseSummary {
   updatedAt: number
 }
 
+/** One itemized outcome of a directory synchronization, mirroring the host. */
+export interface DirectorySyncItem {
+  relativePath: string
+  kind: 'file' | 'directory'
+  documentId?: string
+  action: 'created' | 'updated' | 'unchanged' | 'deleted' | 'failed'
+  error?: { code: string; message: string }
+}
+
+/** The truthful aggregate a directory import or rescan returns. */
+export interface DirectorySyncResult {
+  sourceId: string
+  status: 'synced' | 'unchanged' | 'partial'
+  created: number
+  updated: number
+  unchanged: number
+  deleted: number
+  failed: number
+  items: DirectorySyncItem[]
+}
+
 /** Read-only preview of what one delete would remove. The panel fetches this
  *  before a destructive call so a cascading directory delete is never silent. */
 export interface DeleteImpact {
@@ -557,12 +578,27 @@ export class KnowledgeApi {
     return this.call('POST', `/bases/${encodeURIComponent(baseId)}/import-directory`, { baseId, path })
   }
 
-  importDirectoryTree(baseId: string, path: string): Promise<{ imported: number; directories: number; errors: Array<{ file: string; error: string }> }> {
+  importDirectoryTree(baseId: string, path: string): Promise<{
+    imported: number
+    directories: number
+    errors: Array<{ file: string; error: string }>
+    sourceId: string
+    mode: 'created' | 'synced'
+    sync: DirectorySyncResult
+  }> {
     return this.call('POST', `/bases/${encodeURIComponent(baseId)}/import-directory-tree`, { baseId, path })
   }
 
   /** Import a local directory or single file by its absolute path (validated server-side). */
-  importFromPath(baseId: string, path: string): Promise<{ kind: 'directory' | 'file'; imported: number; errors: Array<{ file: string; error: string }> }> {
+  importFromPath(baseId: string, path: string): Promise<{
+    kind: 'directory' | 'file'
+    imported: number
+    errors: Array<{ file: string; error: string }>
+    directories?: number
+    sourceId?: string
+    mode?: 'created' | 'synced'
+    sync?: DirectorySyncResult
+  }> {
     return this.call('POST', `/bases/${encodeURIComponent(baseId)}/import-path`, { baseId, path }, 30 * 60_000)
   }
 
@@ -602,7 +638,7 @@ export class KnowledgeApi {
     return this.call('PATCH', `/documents/${encodeURIComponent(documentId)}`, { title })
   }
 
-  reindexDocument(documentId: string): Promise<{ id: string; chunkCount: number }> {
+  reindexDocument(documentId: string): Promise<{ id: string; chunkCount: number; sync?: DirectorySyncResult }> {
     return this.call('POST', `/documents/${encodeURIComponent(documentId)}/reindex`, undefined, 30 * 60_000)
   }
 
@@ -610,7 +646,7 @@ export class KnowledgeApi {
     return this.call('POST', `/documents/${encodeURIComponent(documentId)}/refresh`)
   }
 
-  reindexDocuments(ids: string[]): Promise<{ reindexed: number; skipped: number }> {
+  reindexDocuments(ids: string[]): Promise<{ reindexed: number; skipped: number; failed: number; items: DirectorySyncItem[] }> {
     return this.call('POST', '/documents/reindex', { ids }, 30 * 60_000)
   }
 
@@ -624,13 +660,19 @@ export class KnowledgeApi {
     return this.call('DELETE', `/documents/${encodeURIComponent(id)}${query}`)
   }
 
-  deleteDocuments(ids: string[], recursive = false): Promise<{ deleted: number }> {
+  /** Delete a selection. `deleted` is the number of documents removed (including
+   *  the descendants of a selected directory); `roots` is the folded count. */
+  deleteDocuments(ids: string[], recursive = false): Promise<{ deleted: number; roots: number }> {
     return this.call('DELETE', '/documents', { ids, recursive })
   }
 
   listChunks(documentId: string, limit?: number): Promise<ChunkView[]> {
-    const query = limit !== undefined ? `?limit=${encodeURIComponent(String(limit))}` : ''
-    return this.call('GET', `/documents/${encodeURIComponent(documentId)}/chunks${query}`)
+    const params = new URLSearchParams()
+    if (limit !== undefined) params.set('limit', String(limit))
+    // The route returns every stored vector unless told otherwise; the preview
+    // never reads them, and they are the bulk of the payload on a large document.
+    params.set('includeEmbeddings', 'false')
+    return this.call('GET', `/documents/${encodeURIComponent(documentId)}/chunks?${params.toString()}`)
   }
 
   search(request: {

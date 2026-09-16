@@ -423,7 +423,14 @@ async function route(
     }
     if (segments.length === 3) {
       if (segments[2] === 'chunks' && method === 'GET') {
-        return service.listChunks(documentId, readIntQuery(query, 'limit'), readIntQuery(query, 'offset'))
+        // Every chunk carries its embedding vector (1024 floats by default, so
+        // megabytes per document), and the panel's preview never reads it.
+        // `includeEmbeddings=false` drops it from the payload; the default keeps
+        // the historical shape for existing callers.
+        const withEmbeddings = query.get('includeEmbeddings') !== 'false'
+        return service
+          .listChunks(documentId, readIntQuery(query, 'limit'), readIntQuery(query, 'offset'))
+          .map(chunk => withEmbeddings ? chunk : (({ embedding: _embedding, ...rest }) => rest)(chunk))
       }
       if (segments[2] === 'reindex' && method === 'POST') return service.reindexDocument(documentId)
       if (segments[2] === 'delete-impact' && method === 'GET') return service.getDeleteImpact(documentId)
