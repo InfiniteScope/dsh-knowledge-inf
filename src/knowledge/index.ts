@@ -193,6 +193,14 @@ const CONCEPT_READ_MAX_CHARS = 20_000
 const CONCEPT_GREP_SNIPPET_PAD = 60
 /** Max characters of any single line grep runs its pattern over (Cherry's catastrophic-backtracking guard). */
 const CONCEPT_GREP_MAX_LINE_CHARS = 2000
+/**
+ * Hard cap for a caller-supplied `rawTextLimit`. The limit exists to bound a
+ * document payload; without an upper bound a single request could ask for the
+ * whole (arbitrarily large) text, and without a lower bound a negative value
+ * slices from the end instead of capping. Clamping lives in the service so
+ * every caller (HTTP, tools, tests) shares the same contract.
+ */
+export const MAX_RAW_TEXT_LIMIT = 5_000_000
 /** How long a finished job's final progress stays visible (Cherry's linger TTL). */
 const PROGRESS_LINGER_TTL_MS = 60_000
 /** A terminal indexing FAILURE stays visible far longer than an in-progress
@@ -233,6 +241,13 @@ interface IndexingFailure {
  *  layer maps it to 409 Conflict so callers can re-submit with a strategy. */
 export class ConflictError extends Error {
   readonly code = 'conflict'
+}
+
+/** Raised when a caller names a base that does not exist; the HTTP layer maps
+ *  it to 404 so a typo answers "not found" instead of a plausible empty
+ *  summary that hides the mistake. */
+export class NotFoundError extends Error {
+  readonly code = 'not_found'
 }
 
 /** A deterministic source-identity failure. Unlike a parse or provider
@@ -2754,7 +2769,7 @@ export class KnowledgeService extends Service {
     const doc = store.getDocument(id)
     if (doc === undefined) throw new Error(`document not found: ${id}`)
     const rawText = doc.rawText
-    const rawTextLimit = opts?.rawTextLimit
+    const rawTextLimit = clampRawTextLimit(opts?.rawTextLimit)
     const truncated = rawText !== undefined && rawTextLimit !== undefined && rawText.length > rawTextLimit
     return {
       id: doc.id,
@@ -2882,6 +2897,11 @@ export class KnowledgeService extends Service {
 
   stats(baseId?: string): BaseStats {
     const store = this.requireStore()
+    // An unknown base must be an explicit error: filtering would answer with a
+    // plausible-looking zero summary that hides the caller's mistake.
+    if (baseId !== undefined && store.getBase(baseId) === undefined) {
+      throw new NotFoundError(`knowledge base not found: ${baseId}`)
+    }
     const bases = baseId !== undefined ? store.listBases().filter(base => base.id === baseId) : store.listBases()
     const documents = bases.flatMap(base => store.listDocuments(base.id))
     const charCount = documents.reduce((sum, doc) => sum + doc.charCount, 0)
@@ -4165,6 +4185,16 @@ function mergeChunkRanges(
 function clampInt(value: number, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback
   return Math.min(max, Math.max(min, Math.trunc(value)))
+}
+
+/**
+ * Clamp a caller-supplied `rawTextLimit` to `[0, MAX_RAW_TEXT_LIMIT]`.
+ * `undefined` and non-finite values mean "no cap" (the caller did not ask for
+ * one); anything else is truncated and bounded. Exported for tests.
+ */
+export function clampRawTextLimit(limit: number | undefined): number | undefined {
+  if (limit === undefined || !Number.isFinite(limit)) return undefined
+  return Math.min(MAX_RAW_TEXT_LIMIT, Math.max(0, Math.trunc(limit)))
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

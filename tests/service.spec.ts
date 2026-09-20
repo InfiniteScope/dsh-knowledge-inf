@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
-import { KnowledgeService } from '../src/knowledge/index.js'
+import { clampRawTextLimit, KnowledgeService, MAX_RAW_TEXT_LIMIT, NotFoundError } from '../src/knowledge/index.js'
 import { estimateContextTokens, serializeContextWindow } from '../src/knowledge/context.js'
 import type { Config } from '../src/knowledge/config.js'
 import type { KnowledgeService as KnowledgeServiceType } from '../src/knowledge/index.js'
@@ -293,6 +293,41 @@ describe('KnowledgeService', () => {
     expect(stats.chunkCount).toBe(2)
     expect(stats.charCount).toBeGreaterThan(0)
     expect(stats.tokenCount).toBeGreaterThan(0)
+  })
+
+  it('rejects stats for an unknown base instead of returning zeros', async () => {
+    const service = await mountService()
+    expect(() => service.stats('missing-base')).toThrow(NotFoundError)
+    expect(() => service.stats('missing-base')).toThrow(/not found/)
+    // The no-baseId form still aggregates every base (the documented all view).
+    expect(service.stats().documentCount).toBe(0)
+  })
+
+  it('clamps rawTextLimit into the supported range', async () => {
+    // Pure bounds: missing/non-finite means "no cap"; a negative cap is 0;
+    // anything above the hard maximum is capped.
+    expect(clampRawTextLimit(undefined)).toBeUndefined()
+    expect(clampRawTextLimit(Number.NaN)).toBeUndefined()
+    expect(clampRawTextLimit(Number.POSITIVE_INFINITY)).toBeUndefined()
+    expect(clampRawTextLimit(-5)).toBe(0)
+    expect(clampRawTextLimit(12.9)).toBe(12)
+    expect(clampRawTextLimit(MAX_RAW_TEXT_LIMIT * 2)).toBe(MAX_RAW_TEXT_LIMIT)
+
+    const service = await mountService()
+    const base = await service.createBase({ name: 'raw-limit' })
+    const doc = await service.addTextDocument({ baseId: base.id, title: 'text', content: 'abcdefghij' })
+    // A negative limit caps to zero instead of slicing from the end.
+    const negative = service.getDocument(doc.id, { rawTextLimit: -5, includeChunks: false })
+    expect(negative.rawText).toBe('')
+    expect(negative.rawTextTruncated).toBe(true)
+    // A normal limit keeps the head prefix and reports truncation.
+    const capped = service.getDocument(doc.id, { rawTextLimit: 4, includeChunks: false })
+    expect(capped.rawText).toBe('abcd')
+    expect(capped.rawTextTruncated).toBe(true)
+    // No limit returns the whole text (and is not reported as truncated).
+    const full = service.getDocument(doc.id, { includeChunks: false })
+    expect(full.rawText).toBe('abcdefghij')
+    expect(full.rawTextTruncated).toBeUndefined()
   })
 
   it('applies per-base config overrides without touching the global config', async () => {
