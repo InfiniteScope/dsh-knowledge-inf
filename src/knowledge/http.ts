@@ -8,7 +8,7 @@
 
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { ConflictError, DirectorySourceError, StorageUnavailableError, type KnowledgeService } from './index.js'
+import { ConflictError, DirectorySourceError, NotFoundError, StorageUnavailableError, type KnowledgeService } from './index.js'
 import type { ConfigOverrides } from './domain.js'
 import type {
   AddFileDocumentRequest,
@@ -76,6 +76,13 @@ async function handleRequest(service: KnowledgeService, req: IncomingMessage, re
     // conflict strategy instead of treating the import as a server error.
     if (error instanceof ConflictError) {
       writeJson(res, 409, { ok: false, error: { code: 'conflict', message: error.message } })
+      return
+    }
+    // A named entity that does not exist is a caller mistake, not a server
+    // failure: 404 keeps it distinct from the 5xx bucket (and from the empty
+    // success a filtered summary would have produced).
+    if (error instanceof NotFoundError) {
+      writeJson(res, 404, { ok: false, error: { code: 'not_found', message: error.message } })
       return
     }
     if (error instanceof DirectorySourceError) {
