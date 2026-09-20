@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Domain, KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { Context } from '@deepseek-ai/cordis'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -636,6 +637,34 @@ describe('DomainStore wiring', () => {
       await (service as unknown as { store: { close(): Promise<void> } }).store.close()
     } finally {
       await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('releases the SQLite store when the plugin fiber is disposed, so the home can be removed', async () => {
+    // The supported teardown path is fiber disposal, not reaching into the
+    // private store: its effects must close the SQLite chunk store. On Windows
+    // an open SQLite handle makes the unlink fail with EPERM and leaves the
+    // directory behind, so this contract is what a temp-home cleanup (the
+    // benchmark) relies on. Runs in the Native job on Windows/macOS/Linux.
+    const dir = await tempDir()
+    try {
+      vi.stubEnv('DSH_HOME', dir)
+      const ctx = new Context()
+      ctx.provide('webServer', { routes: [], register: () => () => {} })
+      ctx.provide('storageDomain', { open: async () => fakeDomain() })
+      const fiber = await ctx.plugin(KnowledgeService, { ...TEST_CONFIG, chunkStorePath: join(dir, 'chunks.sqlite') })
+      const service = ctx.get('knowledge') as KnowledgeService
+
+      const base = await service.createBase({ name: 'lifecycle' })
+      await service.addTextDocument({ baseId: base.id, title: 'notes', content: 'chunks land in the sqlite file' })
+      expect(existsSync(join(dir, 'chunks.sqlite'))).toBe(true)
+
+      await fiber.dispose()
+      // Fails with EPERM on Windows if disposal left the SQLite handle open.
+      await rm(dir, { recursive: true, force: false })
+      expect(existsSync(dir)).toBe(false)
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => {})
     }
   })
 

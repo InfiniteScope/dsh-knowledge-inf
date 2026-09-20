@@ -1,12 +1,30 @@
 #!/usr/bin/env node
 
 import { Context } from '@deepseek-ai/cordis'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { performance } from 'node:perf_hooks'
 import * as KnowledgeModule from '../lib/knowledge/index.js'
 import * as ToolKnowledgeModule from '../lib/tool-knowledge/index.js'
+
+// Hermetic run: the benchmark builds its own corpus, so it must never read or
+// write the developer's real DSH profile. Without this override the chunk
+// store, raw snapshots and model cache land in <DSH_HOME or ~/.dsh>, and the
+// unfiltered searches can match — and print as hit titles — the developer's
+// private bases. A throwaway home also keeps the metrics machine-independent.
+const BENCHMARK_HOME = mkdtempSync(join(tmpdir(), 'dsh-knowledge-benchmark-'))
+process.env.DSH_HOME = BENCHMARK_HOME
+
+/**
+ * The mounted plugin fiber, disposed before the temp home is removed. Its
+ * effects close the SQLite chunk store (and release any worker), and Windows
+ * refuses to unlink a file whose handle is still open (EPERM): cleanup MUST
+ * run after disposal, or every run leaks its home into %TEMP%.
+ */
+let activeFiber = null
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const MANIFEST_PATH = join(ROOT, 'benchmarks', 'corpus', 'manifest.json')
@@ -500,7 +518,7 @@ async function main() {
   const rssBefore = process.memoryUsage().rss
   const ctx = new Context()
   ctx.provide('webServer', fakeWebServer())
-  await ctx.plugin(KnowledgeService, CONFIG)
+  activeFiber = await ctx.plugin(KnowledgeService, CONFIG)
   const service = ctx.get('knowledge')
   const bases = new Map()
   for (const document of manifest.documents) {
@@ -581,4 +599,22 @@ async function main() {
 main().catch(error => {
   console.error(error instanceof Error ? error.message : String(error))
   process.exitCode = 1
+}).finally(async () => {
+  // Unload the plugin BEFORE removing the temp home: its effects close the
+  // SQLite chunk store, and Windows refuses to unlink an open file (EPERM).
+  if (activeFiber !== null) {
+    try {
+      await activeFiber.dispose()
+    } catch (error) {
+      console.error(`benchmark plugin dispose failed: ${error instanceof Error ? error.message : String(error)}`)
+      process.exitCode = 1
+    }
+  }
+  try {
+    rmSync(BENCHMARK_HOME, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  } catch (error) {
+    // No longer silent: a leftover home means the hermetic guarantee broke.
+    console.error(`benchmark left its temporary home behind (${BENCHMARK_HOME}): ${error instanceof Error ? error.message : String(error)}`)
+    process.exitCode = 1
+  }
 })
