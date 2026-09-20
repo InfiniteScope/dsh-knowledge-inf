@@ -9,23 +9,26 @@ import { createServer } from 'node:http'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { Config } from '../src/knowledge/config.js'
 import { estimateContextTokens } from '../src/knowledge/context.js'
 import { KnowledgeService } from '../src/knowledge/index.js'
 import { autoRetrieveBackground } from '../src/tool-knowledge/index.js'
 
-const BASE_CONFIG = {
+const BASE_CONFIG: Config = {
   embeddingProvider: 'none', embeddingBaseUrl: '', embeddingModel: '', embeddingApiKey: '',
   rerankModel: '', rerankBaseUrl: '', rerankApiKey: '',
+  localRerankTimeoutMs: 60_000,
   smartChunk: true, chunkSeparator: '\n\n', chunkSize: 1024, chunkOverlap: 200,
-  topK: 4, searchMode: 'auto' as const, similarityThreshold: 0, mmrDiversity: 0,
+  topK: 4, searchMode: 'auto', similarityThreshold: 0, mmrDiversity: 0,
   rrfVectorWeight: 1, embeddingBatchSize: 32, siblingChunks: 1,
   localModelCacheDir: '', hfEndpoint: '', chunkStorePath: '',
-  documentProcessorProvider: 'builtin' as const, mineruApiKey: '', mineruApiHost: '',
+  documentProcessorProvider: 'builtin', mineruApiKey: '', mineruApiHost: '',
   semanticChunk: false, semanticChunkThreshold: 0.75, chunkTokenLimit: 0,
-  conflictStrategy: 'rename' as const, urlRefreshHours: 0,
-  imageCaptionProvider: 'off' as const, imageCaptionModel: '', imageCaptionBaseUrl: '', imageCaptionApiKey: '',
+  conflictStrategy: 'rename', urlRefreshHours: 0,
+  imageCaptionProvider: 'off', imageCaptionModel: '', imageCaptionBaseUrl: '', imageCaptionApiKey: '',
   resumeInterruptedOnStartup: true,
-  autoRetrieve: true,
+  autoRetrieve: true, autoRetrieveWeight: 3,
+  localWorkerIdleTimeoutMs: 60_000,
 }
 
 let failures = 0
@@ -77,7 +80,7 @@ try {
   // ── 1. single-base factual question → injects ──────────────────────────────
   console.log('\n1. single-base factual question')
   const a1 = stubAgent('zh')
-  await autoRetrieveBackground(service as never, a1 as never, '公司的报销流程是什么？')
+  await autoRetrieveBackground(service, a1, '公司的报销流程是什么？')
   check('injects for a factual question', a1.injected.length === 1)
   if (a1.injected.length > 0) {
     const text = textOf(a1.injected[0])
@@ -87,7 +90,7 @@ try {
 
   // ── 2. same-topic follow-up → no duplicate chunk; may add a NEW chunk ──────
   console.log('\n2. same-topic follow-up')
-  await autoRetrieveBackground(service as never, a1 as never, '那发票需要什么？')
+  await autoRetrieveBackground(service, a1, '那发票需要什么？')
   check('follow-up injects at most one additional chunk', a1.injected.length <= 2, `got ${a1.injected.length}`)
   if (a1.injected.length === 2) {
     // Two injections must not be the identical chunk text (dedup held).
@@ -96,7 +99,7 @@ try {
 
   // ── 3. new topic → injects the new document ────────────────────────────────
   console.log('\n3. new topic')
-  await autoRetrieveBackground(service as never, a1 as never, '年假怎么申请？')
+  await autoRetrieveBackground(service, a1, '年假怎么申请？')
   check('new topic injects', a1.injected.length > 0)
   const lastText = a1.injected.length > 0 ? textOf(a1.injected[a1.injected.length - 1]) : ''
   check('last injection covers the 年假 doc', lastText.includes('年假'))
@@ -104,16 +107,16 @@ try {
   // ── 4. unrelated chit-chat → nothing ───────────────────────────────────────
   console.log('\n4. unrelated messages')
   const a2 = stubAgent('chat')
-  await autoRetrieveBackground(service as never, a2 as never, '你好呀今天天气不错')
+  await autoRetrieveBackground(service, a2, '你好呀今天天气不错')
   check('chit-chat injects nothing', a2.injected.length === 0)
-  await autoRetrieveBackground(service as never, a2 as never, '帮我算一下 23 乘以 47 等于多少')
+  await autoRetrieveBackground(service, a2, '帮我算一下 23 乘以 47 等于多少')
   check('math question injects nothing', a2.injected.length === 0)
 
   // ── 5. named-base targeting ────────────────────────────────────────────────
   console.log('\n5. named-base targeting')
   const a3 = stubAgent('named')
   // "HR Manual" named → only that base searched; Chinese base must not leak.
-  await autoRetrieveBackground(service as never, a3 as never, '看看 HR Manual 里的 expense reimbursement 流程')
+  await autoRetrieveBackground(service, a3, '看看 HR Manual 里的 expense reimbursement 流程')
   check('named-base query injects', a3.injected.length === 1)
   if (a3.injected.length > 0) {
     const text = textOf(a3.injected[0])
@@ -124,7 +127,7 @@ try {
   console.log('\n6. cross-base coverage')
   const a4 = stubAgent('multi')
   // "reimbursement" matches both bases' expense docs → expect both bases voted in.
-  await autoRetrieveBackground(service as never, a4 as never, 'reimbursement 报销 流程')
+  await autoRetrieveBackground(service, a4, 'reimbursement 报销 流程')
   check('cross-base query injects', a4.injected.length === 1)
   if (a4.injected.length > 0) {
     const text = textOf(a4.injected[0])
@@ -134,12 +137,12 @@ try {
   // ── 7. dedup across time window ────────────────────────────────────────────
   console.log('\n7. dedup across turns')
   const a5 = stubAgent('dedup')
-  await autoRetrieveBackground(service as never, a5 as never, '报销流程是什么？')
+  await autoRetrieveBackground(service, a5, '报销流程是什么？')
   expectInjections(a5, 1, 'first injection')
   // A NEW topic (直属上级审批 — no keyword overlap with the first query) whose
   // ONLY lexical match is the very chunk injected in turn 1: the chunk-id
   // dedup must suppress the repeat instead of re-injecting it.
-  await autoRetrieveBackground(service as never, a5 as never, '直属上级审批')
+  await autoRetrieveBackground(service, a5, '直属上级审批')
   check('same chunk not re-injected', a5.injected.length === 1)
 
   // ── 8. query-centred long chunk keeps a tail answer under the hard budget ──
@@ -153,7 +156,7 @@ try {
   })
   await service.waitForIdle()
   const a6 = stubAgent('long')
-  await autoRetrieveBackground(service as never, a6 as never, '长文档截断测试')
+  await autoRetrieveBackground(service, a6, '长文档截断测试')
   check('long doc query injects', a6.injected.length === 1)
   if (a6.injected.length > 0) {
     const text = textOf(a6.injected[0])
@@ -165,7 +168,7 @@ try {
   // ── 9. weak match → nothing ────────────────────────────────────────────────
   console.log('\n9. weak match')
   const a7 = stubAgent('weak')
-  await autoRetrieveBackground(service as never, a7 as never, '量子物理与弦理论的最新进展')
+  await autoRetrieveBackground(service, a7, '量子物理与弦理论的最新进展')
   check('unrelated technical query injects nothing', a7.injected.length === 0)
 
   // ── 10. high-frequency hammering (10 rapid messages) ───────────────────────
@@ -173,7 +176,7 @@ try {
   const a8 = stubAgent('hammer')
   const topics = ['报销流程', '年假制度', '体检安排', '报销发票', '年假天数', '体检项目', '报销金额', '年假顺延', '体检家属', '报销审批']
   for (const topic of topics) {
-    await autoRetrieveBackground(service as never, a8 as never, `${topic}是什么`)
+    await autoRetrieveBackground(service, a8, `${topic}是什么`)
   }
   // Topic-aware throttle + dedup should cap injections well below 10.
   check('10 rapid messages produce ≤6 injections (throttle+dedup)', a8.injected.length <= 6, `got ${a8.injected.length}`)
@@ -183,7 +186,7 @@ try {
   console.log('\n11. concurrent agents')
   const agents = Array.from({ length: 8 }, (_, i) => stubAgent(`conc${i}`))
   const queries = ['报销流程', '年假', '体检', 'onboarding', 'expenses', '发票', '审批', 'equipment']
-  await Promise.all(agents.map((agent, i) => autoRetrieveBackground(service as never, agent as never, queries[i])))
+  await Promise.all(agents.map((agent, i) => autoRetrieveBackground(service, agent, queries[i])))
   const injectedCount = agents.filter(a => a.injected.length > 0).length
   check('concurrent agents complete without throwing', injectedCount >= 0)
   check('at least half of concurrent agents injected relevant background', injectedCount >= 4, `got ${injectedCount}`)
@@ -200,7 +203,7 @@ try {
   })
   await service.waitForIdle()
   const a9 = stubAgent('excluded')
-  await autoRetrieveBackground(service as never, a9 as never, '量子物理弦理论前沿进展')
+  await autoRetrieveBackground(service, a9, '量子物理弦理论前沿进展')
   check('weight-0 base contributes nothing', a9.injected.length === 0, `got ${a9.injected.length}`)
 
   // ── 13. per-base weight: weight-1 base is capped to a single seat ──────────
@@ -218,7 +221,7 @@ try {
   }
   await service.waitForIdle()
   const a10 = stubAgent('seat')
-  await autoRetrieveBackground(service as never, a10 as never, '明基 投影仪 4K 分辨率 会议演示')
+  await autoRetrieveBackground(service, a10, '明基 投影仪 4K 分辨率 会议演示')
   check('weight-1 base injects', a10.injected.length === 1, `got ${a10.injected.length}`)
   if (a10.injected.length === 1) {
     const text = textOf(a10.injected[0])
@@ -237,7 +240,7 @@ try {
   }
   await service.waitForIdle()
   const a11 = stubAgent('control')
-  await autoRetrieveBackground(service as never, a11 as never, '明基 投影仪 4K 分辨率 会议演示')
+  await autoRetrieveBackground(service, a11, '明基 投影仪 4K 分辨率 会议演示')
   check('default-weight control injects one bundled message', a11.injected.length === 1, `got ${a11.injected.length}`)
   if (a11.injected.length === 1) {
     const text = textOf(a11.injected[0])
@@ -288,7 +291,7 @@ try {
   await service.addTextDocument({ baseId: rerankBase.id, title: '次选文档', content: '主题甲 相关内容。' })
   await service.waitForIdle()
   const a12 = stubAgent('rerank')
-  await autoRetrieveBackground(service as never, a12 as never, '主题甲 相关内容')
+  await autoRetrieveBackground(service, a12, '主题甲 相关内容')
   check('rerank path injects exactly the rerank winner', a12.injected.length === 1, `got ${a12.injected.length}`)
   if (a12.injected.length === 1) {
     const text = textOf(a12.injected[0])
@@ -309,7 +312,7 @@ try {
   await service.waitForIdle()
   const expectNone = async (label: string, input: string): Promise<void> => {
     const agent = stubAgent(`noise-${label}`)
-    await autoRetrieveBackground(service as never, agent as never, input)
+    await autoRetrieveBackground(service, agent, input)
     check(`${label} injects nothing`, agent.injected.length === 0, `got ${agent.injected.length}`)
   }
   await expectNone('pure symbols', '！！！！！！！！')
@@ -318,7 +321,7 @@ try {
   await expectNone('bare digits', '12345678')
   await expectNone('laugh', '哈哈哈哈哈哈哈哈哈')
   const a13 = stubAgent('short-query')
-  await autoRetrieveBackground(service as never, a13 as never, '报销流程？')
+  await autoRetrieveBackground(service, a13, '报销流程？')
   check('short symbol-wrapped query still injects', a13.injected.length === 1, `got ${a13.injected.length}`)
 
   console.log(`\n${checks} checks, ${failures} failed`)

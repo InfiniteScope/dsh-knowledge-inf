@@ -22,6 +22,18 @@ describe('chunkText', () => {
     }
   })
 
+  it('never emits an empty chunk when the overlap lands in whitespace', () => {
+    // Regression: windowBlock advances by `cut - overlap`; with a large overlap
+    // the next window can start inside a run of whitespace, trim to '', and
+    // previously entered the chunk list as an empty chunk.
+    const text = 'a'.repeat(300) + ' '.repeat(300) + '\n' + ' '.repeat(300) + 'b'.repeat(300)
+    const chunks = chunkText(text, 64, 63)
+    expect(chunks.length).toBeGreaterThan(0)
+    for (const chunk of chunks) expect(chunk.text.trim().length).toBeGreaterThan(0)
+    expect(chunks.some(chunk => chunk.text.includes('a'))).toBe(true)
+    expect(chunks.some(chunk => chunk.text.includes('b'))).toBe(true)
+  })
+
   it('splits on paragraph boundaries', () => {
     const text = 'first paragraph\n\nsecond paragraph\n\nthird paragraph'
     expect(chunkText(text, 800, 100).map(c => c.text)).toEqual(['first paragraph', 'second paragraph', 'third paragraph'])
