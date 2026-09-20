@@ -10,7 +10,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 // Activates the `Context.knowledge` merge declared by the knowledge service.
 import type {} from '../knowledge/index.js'
-import { estimateContextTokens, serializeContextWindow } from '../knowledge/context.js'
+import { estimateContextTokens, serializeContextWindow } from '../knowledge/context-protocol.js'
 import type { KnowledgeService } from '../knowledge/index.js'
 import type { ContextWindow, SearchHit, SearchResult } from '../knowledge/types.js'
 

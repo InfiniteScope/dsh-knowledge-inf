@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
 import {
   composeContextWindow,
   estimateContextTokens,
   serializeContextWindow,
 } from '../src/knowledge/context.js'
+import {
+  estimateContextTokens as protocolEstimate,
+  serializeContextWindow as protocolSerialize,
+} from '../src/knowledge/context-protocol.js'
 import type { KnowledgeChunk } from '../src/knowledge/types.js'
 
 function chunk(index: number, text: string, heading = 'Guide', docId = 'doc-1'): KnowledgeChunk {
@@ -208,5 +213,28 @@ describe('composeContextWindow', () => {
     expect(window.after).toEqual([])
     expect(window.hasMoreBefore).toBe(false)
     expect(window.hasMoreAfter).toBe(true)
+  })
+})
+
+describe('context protocol boundary', () => {
+  it('serves the pure helpers from context-protocol and re-exports them from the engine module', () => {
+    // Both host entries (knowledge engine + model tools) import the protocol
+    // module, so it must stay the single definition the engine re-exports.
+    expect(estimateContextTokens).toBe(protocolEstimate)
+    expect(serializeContextWindow).toBe(protocolSerialize)
+  })
+
+  it('keeps the estimator deterministic and CJK-aware', () => {
+    expect(protocolEstimate('')).toBe(0)
+    expect(protocolEstimate('abcd')).toBe(1)
+    expect(protocolEstimate('中文'.repeat(10))).toBe(Math.ceil(20 / 1.5))
+  })
+
+  it('keeps the model tools on the protocol module instead of the engine module', () => {
+    // The tool host entry must not re-import the engine module: a stateful
+    // helper added there would be silently duplicated into both bundles.
+    const source = readFileSync(new URL('../src/tool-knowledge/index.ts', import.meta.url), 'utf8')
+    expect(source).toMatch(/from '\.\.\/knowledge\/context-protocol\.js'/)
+    expect(source).not.toMatch(/from '\.\.\/knowledge\/context\.js'/)
   })
 })

@@ -67,10 +67,15 @@ export function chunkText(
 
 function windowOrKeep(blockText: string, size: number, overlap: number, heading: string | undefined): ChunkPiece[] {
   if (blockText.length <= size) return [{ text: blockText, ...(heading !== undefined ? { heading } : {}) }]
-  return windowBlock(blockText, size, overlap).map(piece => ({
-    text: piece,
-    ...(heading !== undefined ? { heading } : {}),
-  }))
+  return windowBlock(blockText, size, overlap)
+    // A window whose overlap lands inside a run of whitespace trims to the
+    // empty string; drop those pieces here (the windowing loop must still
+    // advance past them) so a chunk list never contains empty chunks.
+    .filter(piece => piece.length > 0)
+    .map(piece => ({
+      text: piece,
+      ...(heading !== undefined ? { heading } : {}),
+    }))
 }
 
 /** Let users type `\n\n` literally; convert it to real newlines. */
