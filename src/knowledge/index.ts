@@ -450,7 +450,15 @@ export class KnowledgeService extends Service {
             await store.deleteDocument(id)
             continue
           }
-          const text = await parseDocumentBuffer(bytes, doc.fileName ?? doc.title, doc.mimeType)
+          // Same processor chain as the import: a crash during a MinerU import
+          // is resumed through MinerU instead of failing on a local parser that
+          // cannot read the scanned source.
+          const { text } = await this.extractDocumentText({
+            baseId: doc.baseId,
+            fileName: doc.fileName ?? doc.title,
+            ...(doc.mimeType !== undefined ? { mimeType: doc.mimeType } : {}),
+            bytes,
+          })
           if (text.trim().length === 0) throw new Error('parsed document is empty')
           await this.ingestDocument({
             baseId: doc.baseId,
@@ -944,25 +952,23 @@ export class KnowledgeService extends Service {
         // Cherry's fileProcessorId posture: when the MinerU remote processor
         // is configured, PDFs go through the API first (scanned/complex
         // layouts get true layout-aware Markdown); any failure falls back to
-        // the local pipeline.
+        // the local pipeline. A double failure reports BOTH reasons, so the
+        // row shows why the remote processor rejected the file (log-only
+        // before) instead of just the local parser's complaint.
         const config = this.getConfigFor(request.baseId)
-        let text: string | null = null
-        if (config.documentProcessorProvider === 'mineru' && config.mineruApiKey.trim() !== ''
-          && extensionOf(fileName) === 'pdf') {
-          try {
-            const { extractPdfWithMineru } = await import('./mineru.js')
-            text = await extractPdfWithMineru(bytes, fileName, {
-              apiKey: config.mineruApiKey,
-              apiHost: config.mineruApiHost,
-            }, taskController.signal)
-          } catch (error) {
-            this.ctx.logger.warn(`knowledge: mineru extract failed, falling back to local: ${error instanceof Error ? error.message : String(error)}`)
-          }
+        const extracted = await this.extractDocumentText({
+          baseId: request.baseId,
+          fileName,
+          ...(request.mimeType !== undefined ? { mimeType: request.mimeType } : {}),
+          bytes,
+          signal: taskController.signal,
+        })
+        let text = extracted.text
+        if (text.trim().length === 0) {
+          throw new Error(extracted.remoteError !== undefined
+            ? `parsed document is empty; MinerU extraction had failed (${extracted.remoteError})`
+            : 'parsed document is empty')
         }
-        if (text === null) {
-          text = await parseDocumentBuffer(bytes, fileName, request.mimeType)
-        }
-        if (text.trim().length === 0) throw new Error('parsed document is empty')
         // Image/table captioning (NexusRAG-style visual intelligence): embedded
         // PDF figures get VLM descriptions appended so charts become searchable.
         // Best-effort — a provider failure leaves the parsed text untouched.
@@ -1746,9 +1752,61 @@ export class KnowledgeService extends Service {
     }
   }
 
+  /**
+   * Extract a file's text through the base's configured processor chain: the
+   * remote MinerU API first when this base selects it for a PDF, then the local
+   * parsers. Returns the text plus the remote failure reason when one occurred.
+   *
+   * Import and every later rebuild (reindex, startup resume) go through here,
+   * so a document imported with MinerU is rebuilt with MinerU too — a scanned
+   * PDF whose remote extraction failed is recoverable by reindexing instead of
+   * being stuck on a local parser that cannot read it. Throws only when the
+   * remote processor was tried AND the local parsers also failed, with both
+   * reasons in the message (the import row then shows why the remote failed,
+   * which used to be log-only). An aborted extraction (the document was
+   * deleted) is rethrown as-is: it must not fall back to a local parse that can
+   * hold the worker for minutes.
+   */
+  private async extractDocumentText(input: {
+    baseId: string
+    fileName: string
+    mimeType?: string
+    bytes: Uint8Array
+    signal?: AbortSignal
+  }): Promise<{ text: string; remoteError?: string }> {
+    const config = this.getConfigFor(input.baseId)
+    let remoteError: string | undefined
+    if (config.documentProcessorProvider === 'mineru' && config.mineruApiKey.trim() !== ''
+      && extensionOf(input.fileName) === 'pdf') {
+      try {
+        const { extractPdfWithMineru } = await import('./mineru.js')
+        const text = await extractPdfWithMineru(input.bytes, input.fileName, {
+          apiKey: config.mineruApiKey,
+          apiHost: config.mineruApiHost,
+        }, input.signal)
+        return { text }
+      } catch (error) {
+        if (input.signal?.aborted === true) throw error
+        remoteError = error instanceof Error ? error.message : String(error)
+        this.ctx.logger.warn(`knowledge: mineru extract failed, falling back to local: ${remoteError}`)
+      }
+    }
+    try {
+      const text = await parseDocumentBuffer(input.bytes, input.fileName, input.mimeType)
+      return { text, ...(remoteError !== undefined ? { remoteError } : {}) }
+    } catch (error) {
+      const localError = error instanceof Error ? error.message : String(error)
+      if (remoteError !== undefined) {
+        throw new Error(`MinerU extraction failed (${remoteError}); local parsing failed (${localError})`)
+      }
+      throw error
+    }
+  }
+
   /** Rebuild source text of a document. A path-imported single file (sourcePath)
    *  is re-read from disk first so EDITS and a repointed source (setBaseSourcePath)
-   *  are picked up, refreshing the persisted raw copy; otherwise the raw copy,
+   *  are picked up, refreshing the persisted raw copy; otherwise the raw copy
+   *  (parsed through the base's configured processor: MinerU first when set),
    *  then persisted text, then reconstructed chunks are used. Returns the rebuilt
    *  text and, when the raw copy was refreshed, its new base-relative path. */
   private async sourceTextOf(document: KnowledgeDocument): Promise<{
@@ -1769,7 +1827,11 @@ export class KnowledgeService extends Service {
           const fileName = basename(document.sourcePath)
           // A repointed source may use a different extension. Dispatch from
           // the live source identity rather than stale fileName/MIME metadata.
-          const text = await parseDocumentBuffer(buffer, fileName)
+          const { text } = await this.extractDocumentText({
+            baseId: document.baseId,
+            fileName,
+            bytes: buffer,
+          })
           if (text.trim().length > 0) {
             if (store.raw !== undefined) {
               // Always stage to a fresh path. The caller switches the document
@@ -1793,7 +1855,15 @@ export class KnowledgeService extends Service {
       const raw = await store.raw?.read(document.rawFilePath)
       if (raw !== null && raw !== undefined && raw.byteLength > 0) {
         try {
-          const text = await parseDocumentBuffer(raw, document.fileName ?? document.title, document.mimeType)
+          // The configured processor first (MinerU when this base selects it
+          // for a PDF): a reindex must rebuild the document the way the import
+          // did, and this is what makes a failed remote import recoverable.
+          const { text } = await this.extractDocumentText({
+            baseId: document.baseId,
+            fileName: document.fileName ?? document.title,
+            ...(document.mimeType !== undefined ? { mimeType: document.mimeType } : {}),
+            bytes: raw,
+          })
           if (text.trim().length > 0) return { text }
         } catch (error) {
           this.ctx.logger.warn(`knowledge: re-parsing raw source failed, falling back to stored text: ${error instanceof Error ? error.message : String(error)}`)
@@ -1803,7 +1873,9 @@ export class KnowledgeService extends Service {
       }
     }
     const text = document.rawText ?? reconstructFromChunks(this.requireStore().listChunksByDoc(document.id))
-    if (text.trim().length === 0) throw new Error(`document "${document.title}" has no source text to reindex`)
+    if (text.trim().length === 0) {
+      throw new Error(`document "${document.title}" has no source text to reindex (its source could not be parsed — check the document processor settings, or re-import the file)`)
+    }
     return { text }
   }
 
