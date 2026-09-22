@@ -12,13 +12,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Domain, KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { Context } from '@deepseek-ai/cordis'
 import { createServer, type Server } from 'node:http'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import JSZip from 'jszip'
 import { knowledgeDomainSpec } from '../src/knowledge/domain.js'
 import { KnowledgeService } from '../src/knowledge/index.js'
 import type { Config } from '../src/knowledge/config.js'
+import type { Store } from '../src/knowledge/store.js'
 
 class FakeTable<K extends string, V> implements KvTable<K, V> {
   readonly map = new Map<K, V>()
@@ -67,17 +68,18 @@ interface FakeMineru {
   readonly server: Server
   readonly url: string
   /** Every API call, including ones answered with a failure. */
-  readonly state: { failing: boolean; calls: number }
+  readonly state: { failing: boolean; failNext: number; calls: number }
 }
 
 /** Minimal MinerU v4 API stand-in: batch create → upload → poll → result zip. */
 async function startFakeMineru(): Promise<FakeMineru> {
-  const state = { failing: false, calls: 0 }
+  const state = { failing: false, failNext: 0, calls: 0 }
   const server = createServer((req, res) => {
     req.on('data', () => {})
     req.on('end', () => {
       state.calls += 1
-      if (state.failing) {
+      if (state.failing || state.failNext > 0) {
+        if (!state.failing) state.failNext -= 1
         res.writeHead(500).end('fake mineru outage')
         return
       }
@@ -136,6 +138,10 @@ async function mount(mineruUrl: string): Promise<KnowledgeService> {
   return ctx.get('knowledge') as KnowledgeService
 }
 
+function storeOf(service: KnowledgeService): Store {
+  return (service as unknown as { store: Store }).store
+}
+
 /** Bytes no local parser can read: only the fake MinerU can extract text from them. */
 const NOT_A_PDF = Buffer.from('scanned-looking bytes without a text layer').toString('base64')
 
@@ -160,6 +166,14 @@ describe('MinerU recovery (issue #30)', () => {
     // Both reasons reach the row: the remote outage AND the local parser failure.
     expect(failed?.embeddingError).toMatch(/MinerU extraction failed/)
     expect(failed?.embeddingError).toMatch(/local parsing failed/)
+
+    // An explicit retry while both processors still fail must report the
+    // underlying reasons instead of a generic missing-source message.
+    await expect(service.reindexDocument(doc.id)).rejects.toThrow(/MinerU extraction failed .*local parsing failed/)
+    // A completed failed import is not a crash-resume candidate at startup.
+    const recovery = await storeOf(service).recoverInterruptedImports(Date.now() + 1)
+    expect(recovery.resume).not.toContain(doc.id)
+    expect(storeOf(service).getDocument(doc.id)?.errorCode).toBe('parse_failed')
 
     // The processor works again: reindexing rebuilds the document through it.
     mineru.state.failing = false
@@ -206,5 +220,62 @@ describe('MinerU recovery (issue #30)', () => {
 
     expect(mineru.state.calls).toBe(0)
     expect(service.getDocument(doc.id, { includeChunks: false }).rawText).toContain('local text survives')
+  })
+
+  it('does not send identical live and cached bytes to MinerU twice in one reindex', async () => {
+    const mineru = await startFakeMineru()
+    servers.push(mineru.server)
+    const service = await mount(mineru.url)
+    const base = await service.createBase({ name: 'same source' })
+    mineru.state.failing = true
+    const doc = await service.addFileDocument({
+      baseId: base.id, fileName: 'scan.pdf', mimeType: 'application/pdf', contentBase64: NOT_A_PDF,
+    })
+    await service.waitForIdle()
+    const sourcePath = join(homes.at(-1)!.dir, 'scan.pdf')
+    await writeFile(sourcePath, Buffer.from(NOT_A_PDF, 'base64'))
+    await storeOf(service).putDocument({ ...storeOf(service).getDocument(doc.id)!, sourcePath })
+
+    const before = mineru.state.calls
+    await expect(service.reindexDocument(doc.id)).rejects.toThrow(/MinerU extraction failed .*local parsing failed/)
+    expect(mineru.state.calls - before).toBe(1)
+  })
+
+  it('tries a distinct cached raw source after the live path fails', { timeout: 45_000 }, async () => {
+    const mineru = await startFakeMineru()
+    servers.push(mineru.server)
+    const service = await mount(mineru.url)
+    const base = await service.createBase({ name: 'different source' })
+    const doc = await service.addFileDocument({
+      baseId: base.id, fileName: 'scan.pdf', mimeType: 'application/pdf', contentBase64: NOT_A_PDF,
+    })
+    await service.waitForIdle()
+    const sourcePath = join(homes.at(-1)!.dir, 'replacement.pdf')
+    await writeFile(sourcePath, Buffer.from('different invalid PDF bytes'))
+    await storeOf(service).putDocument({ ...storeOf(service).getDocument(doc.id)!, sourcePath })
+
+    mineru.state.failNext = 1
+    const before = mineru.state.calls
+    const rebuilt = await service.reindexDocument(doc.id)
+    expect(rebuilt.rawText).toContain('MinerU markdown')
+    // The failed live request and successful cached request both ran.
+    expect(mineru.state.calls - before).toBeGreaterThan(1)
+  })
+
+  it('retains persisted text when a later MinerU reindex cannot parse the raw PDF', { timeout: 45_000 }, async () => {
+    const mineru = await startFakeMineru()
+    servers.push(mineru.server)
+    const service = await mount(mineru.url)
+    const base = await service.createBase({ name: 'text fallback' })
+    const doc = await service.addFileDocument({
+      baseId: base.id, fileName: 'scan.pdf', mimeType: 'application/pdf', contentBase64: NOT_A_PDF,
+    })
+    await service.waitForIdle()
+    const original = service.getDocument(doc.id, { includeChunks: false }).rawText
+
+    mineru.state.failing = true
+    const rebuilt = await service.reindexDocument(doc.id)
+    expect(rebuilt.rawText).toBe(original)
+    expect(rebuilt.chunkCount).toBeGreaterThan(0)
   })
 })

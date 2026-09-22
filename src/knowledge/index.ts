@@ -1816,6 +1816,9 @@ export class KnowledgeService extends Service {
     previousRawFilePath?: string
   }> {
     const store = this.requireStore()
+    const sourceFailures: string[] = []
+    let failedLiveSourceBytes: Uint8Array | undefined
+    let failedLiveSourceWasPdf = false
     // A single-file path import tracks its live source on disk. Reindex re-reads
     // that path so edits and a repointed source (setBaseSourcePath) are actually
     // applied — the old behavior rebuilt only from the persisted raw copy and
@@ -1827,54 +1830,76 @@ export class KnowledgeService extends Service {
           const fileName = basename(document.sourcePath)
           // A repointed source may use a different extension. Dispatch from
           // the live source identity rather than stale fileName/MIME metadata.
-          const { text } = await this.extractDocumentText({
-            baseId: document.baseId,
-            fileName,
-            bytes: buffer,
-          })
-          if (text.trim().length > 0) {
-            if (store.raw !== undefined) {
-              // Always stage to a fresh path. The caller switches the document
-              // reference only after chunks and metadata commit successfully.
-              const nextRaw = await store.raw.write(document.baseId, crypto.randomUUID(), safeRawExtension(fileName), buffer)
-              return {
-                text,
-                rawFilePath: nextRaw,
-                candidateRawFilePath: nextRaw,
-                ...(document.rawFilePath !== undefined ? { previousRawFilePath: document.rawFilePath } : {}),
-              }
-            }
-            return { text }
+          let text: string
+          try {
+            const extracted = await this.extractDocumentText({
+              baseId: document.baseId,
+              fileName,
+              bytes: buffer,
+            })
+            text = extracted.text
+            if (text.trim().length === 0) throw new Error('parsed document is empty')
+          } catch (error) {
+            failedLiveSourceBytes = buffer
+            failedLiveSourceWasPdf = extensionOf(fileName) === 'pdf'
+            throw error
           }
+          if (store.raw !== undefined) {
+            // Always stage to a fresh path. The caller switches the document
+            // reference only after chunks and metadata commit successfully.
+            const nextRaw = await store.raw.write(document.baseId, crypto.randomUUID(), safeRawExtension(fileName), buffer)
+            return {
+              text,
+              rawFilePath: nextRaw,
+              candidateRawFilePath: nextRaw,
+              ...(document.rawFilePath !== undefined ? { previousRawFilePath: document.rawFilePath } : {}),
+            }
+          }
+          return { text }
         }
       } catch (error) {
-        this.ctx.logger.warn(`knowledge: re-reading source path failed, falling back to stored copy: ${error instanceof Error ? error.message : String(error)}`)
+        const reason = error instanceof Error ? error.message : String(error)
+        sourceFailures.push(`source path: ${reason}`)
+        this.ctx.logger.warn(`knowledge: re-reading source path failed, falling back to stored copy: ${reason}`)
       }
     }
     if (document.rawFilePath !== undefined) {
       const raw = await store.raw?.read(document.rawFilePath)
       if (raw !== null && raw !== undefined && raw.byteLength > 0) {
-        try {
-          // The configured processor first (MinerU when this base selects it
-          // for a PDF): a reindex must rebuild the document the way the import
-          // did, and this is what makes a failed remote import recoverable.
-          const { text } = await this.extractDocumentText({
-            baseId: document.baseId,
-            fileName: document.fileName ?? document.title,
-            ...(document.mimeType !== undefined ? { mimeType: document.mimeType } : {}),
-            bytes: raw,
-          })
-          if (text.trim().length > 0) return { text }
-        } catch (error) {
-          this.ctx.logger.warn(`knowledge: re-parsing raw source failed, falling back to stored text: ${error instanceof Error ? error.message : String(error)}`)
+        if (failedLiveSourceWasPdf && extensionOf(document.fileName ?? document.title) === 'pdf'
+          && failedLiveSourceBytes !== undefined && Buffer.compare(raw, failedLiveSourceBytes) === 0) {
+          // The live path already failed on these exact bytes. A second MinerU
+          // request in the same reindex cannot help and may incur another cost.
+          this.ctx.logger.warn('knowledge: stored raw source matches the failed live source; skipping duplicate parse')
+        } else {
+          try {
+            // A distinct cached source is still a valid recovery candidate.
+            const { text } = await this.extractDocumentText({
+              baseId: document.baseId,
+              fileName: document.fileName ?? document.title,
+              ...(document.mimeType !== undefined ? { mimeType: document.mimeType } : {}),
+              bytes: raw,
+            })
+            if (text.trim().length > 0) return { text }
+            throw new Error('parsed document is empty')
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error)
+            sourceFailures.push(`stored raw source: ${reason}`)
+            this.ctx.logger.warn(`knowledge: re-parsing raw source failed, falling back to stored text: ${reason}`)
+          }
         }
       } else {
         this.ctx.logger.warn(`knowledge: raw source file missing for "${document.title}", falling back to stored text`)
       }
     }
-    const text = document.rawText ?? reconstructFromChunks(this.requireStore().listChunksByDoc(document.id))
+    const text = document.rawText?.trim()
+      ? document.rawText
+      : reconstructFromChunks(this.requireStore().listChunksByDoc(document.id))
     if (text.trim().length === 0) {
-      throw new Error(`document "${document.title}" has no source text to reindex (its source could not be parsed — check the document processor settings, or re-import the file)`)
+      const detail = sourceFailures.length > 0
+        ? sourceFailures.join('; ')
+        : 'its source could not be parsed — check the document processor settings, or re-import the file'
+      throw new Error(`document "${document.title}" has no source text to reindex (${detail})`)
     }
     return { text }
   }
